@@ -7,6 +7,13 @@
 # Usage: bash autofyn_audit/setup.sh
 #        bash autofyn_audit/setup.sh --no-cache   (force image rebuild)
 #
+# Host-port overrides (use when ports 3000/8788 are already taken on the host):
+#        WEB_HOST_PORT=3001 MCP_HOST_PORT=8789 bash autofyn_audit/setup.sh
+#   The container-internal app ports stay 3000/8788; only the host-side
+#   published ports change. Run the exploits with matching bases:
+#        WEB_BASE=http://localhost:3001 MCP_BASE=http://localhost:8789 \
+#            bash autofyn_audit/run_exploits.sh
+#
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -18,9 +25,13 @@ IMAGE_TAG="autofyn-audit:pinned"
 
 WEB_CONTAINER="autofyn-web"
 MCP_CONTAINER="autofyn-mcp"
+# Container-internal app ports (fixed — the apps listen on these inside the container).
 WEB_PORT=3000
 MCP_PORT=8788
 MOCK_PORT=9099
+# Host-side published ports (overridable to avoid conflicts with other workloads).
+WEB_HOST_PORT="${WEB_HOST_PORT:-3000}"
+MCP_HOST_PORT="${MCP_HOST_PORT:-8788}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -52,17 +63,28 @@ warn() { echo -e "${_YELLOW}[WARN]${_RESET} $*"; }
 # ---------------------------------------------------------------------------
 # Step 0 — Commit pin check (AUTHORITATIVE; must pass before docker build)
 # ---------------------------------------------------------------------------
-info "Checking pinned commit…"
+info "Checking pinned app source…"
 command -v git >/dev/null 2>&1 || die "git is not installed."
 ACTUAL_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)" || \
     die "Could not run 'git rev-parse HEAD' in ${REPO_ROOT}. Is this a git repo?"
 
-if [[ "${ACTUAL_COMMIT}" != "${PINNED_COMMIT}" ]]; then
-    die "COMMIT MISMATCH — this audit is pinned to ${PINNED_COMMIT} but HEAD is ${ACTUAL_COMMIT}.
-     Checkout the pinned commit before running setup:
-       git checkout ${PINNED_COMMIT}"
+# The audit pins the *application source* under test to ${PINNED_COMMIT}.
+# The audit deliverables themselves (autofyn_audit/) may be committed on top of
+# that pin across audit rounds, advancing HEAD. Reproducibility therefore means
+# "the audited app code is identical to the pin", NOT "HEAD == pin". We verify
+# that no tracked app/package source has changed since the pinned commit.
+git -C "${REPO_ROOT}" cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null || \
+    die "Pinned commit ${PINNED_COMMIT} not found in this repo. Cannot verify app source."
+
+APP_SOURCE_PATHS=(apps packages package.json bun.lock turbo.json biome.json tsconfig.json)
+if ! git -C "${REPO_ROOT}" diff --quiet "${PINNED_COMMIT}" HEAD -- "${APP_SOURCE_PATHS[@]}" 2>/dev/null; then
+    echo "" >&2
+    git -C "${REPO_ROOT}" diff --stat "${PINNED_COMMIT}" HEAD -- "${APP_SOURCE_PATHS[@]}" >&2
+    die "APP SOURCE MISMATCH — audited app code differs from pinned commit ${PINNED_COMMIT}.
+     The above paths changed since the pin. Re-pin the audit or revert the changes
+     before running setup, otherwise exploit results are not reproducible."
 fi
-ok "Commit pin verified: ${ACTUAL_COMMIT}"
+ok "App source pin verified: identical to ${PINNED_COMMIT} (HEAD=${ACTUAL_COMMIT})"
 
 # ---------------------------------------------------------------------------
 # Step 1 — Idempotent teardown of existing containers
@@ -70,6 +92,27 @@ ok "Commit pin verified: ${ACTUAL_COMMIT}"
 info "Removing any existing audit containers…"
 docker rm -f "${WEB_CONTAINER}" "${MCP_CONTAINER}" 2>/dev/null || true
 ok "Existing containers removed (or did not exist)."
+
+# ---------------------------------------------------------------------------
+# Step 1b — Pre-flight host-port availability check (clear error, not a cryptic
+#           docker bind failure mid-run).
+# ---------------------------------------------------------------------------
+port_in_use() {
+    # Returns 0 if something is already listening on the given host TCP port.
+    curl -s -o /dev/null --max-time 2 "http://localhost:${1}/" 2>/dev/null && return 0
+    # Also catch ports that accept connections but return nothing parseable.
+    (exec 3<>"/dev/tcp/localhost/${1}") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+    return 1
+}
+for p in "${WEB_HOST_PORT}" "${MCP_HOST_PORT}"; do
+    if port_in_use "${p}"; then
+        die "Host port ${p} is already in use by another process/container.
+     Pick free host ports and re-run, e.g.:
+       WEB_HOST_PORT=3001 MCP_HOST_PORT=8789 bash autofyn_audit/setup.sh
+     then run the exploits against them:
+       WEB_BASE=http://localhost:3001 MCP_BASE=http://localhost:8789 bash autofyn_audit/run_exploits.sh"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Step 2 — Build audit image (reuse if already present and --no-cache not given)
@@ -101,6 +144,9 @@ if [[ -f "${AUDIT_STATE_DIR}/mock.pid" ]]; then
     rm -f "${AUDIT_STATE_DIR}/mock.pid"
 fi
 
+# Fresh hit log per setup so SSRF proofs are unambiguous.
+rm -f "${AUDIT_STATE_DIR}/mock_hits.log"
+
 info "Starting mock server on host port ${MOCK_PORT}…"
 python3 "${SCRIPT_DIR}/mock_server.py" &>"${AUDIT_STATE_DIR}/mock_server.log" &
 MOCK_PID=$!
@@ -117,7 +163,7 @@ ok "Mock server ready on port ${MOCK_PORT} (PID ${MOCK_PID})"
 # ---------------------------------------------------------------------------
 # Step 4 — Start web container (next dev on port 3000)
 # ---------------------------------------------------------------------------
-info "Starting ${WEB_CONTAINER} (next dev, port ${WEB_PORT})…"
+info "Starting ${WEB_CONTAINER} (next dev, host port ${WEB_HOST_PORT} -> container ${WEB_PORT})…"
 info "  Note: WRANGLER_SEND_METRICS=false CI=1 are set; no XAI/EXA keys injected by default."
 info "  If you have XAI_API_KEY or EXA_API_KEY, export them before running setup.sh."
 
@@ -129,7 +175,7 @@ WEB_ENV_FLAGS=""
 docker run -d \
     --name "${WEB_CONTAINER}" \
     --add-host=host.docker.internal:host-gateway \
-    -p "${WEB_PORT}:${WEB_PORT}" \
+    -p "${WEB_HOST_PORT}:${WEB_PORT}" \
     -e PORT="${WEB_PORT}" \
     -e WRANGLER_SEND_METRICS=false \
     -e CI=1 \
@@ -143,14 +189,14 @@ ok "${WEB_CONTAINER} started."
 # ---------------------------------------------------------------------------
 # Step 5 — Start MCP container (wrangler dev on port 8788)
 # ---------------------------------------------------------------------------
-info "Starting ${MCP_CONTAINER} (wrangler dev --local, port ${MCP_PORT})…"
+info "Starting ${MCP_CONTAINER} (wrangler dev --local, host port ${MCP_HOST_PORT} -> container ${MCP_PORT})…"
 info "  MCP_URL is intentionally UNSET so C4 (host-header injection) is live-reproducible."
 
 # shellcheck disable=SC2086
 docker run -d \
     --name "${MCP_CONTAINER}" \
     --add-host=host.docker.internal:host-gateway \
-    -p "${MCP_PORT}:${MCP_PORT}" \
+    -p "${MCP_HOST_PORT}:${MCP_PORT}" \
     -e PORT="${MCP_PORT}" \
     -e WRANGLER_SEND_METRICS=false \
     -e WRANGLER_LOG=error \
@@ -163,10 +209,10 @@ ok "${MCP_CONTAINER} started."
 # ---------------------------------------------------------------------------
 # Step 6 — Health-check web (up to WEB_READY_TIMEOUT seconds)
 # ---------------------------------------------------------------------------
-info "Waiting for web app on port ${WEB_PORT} (timeout ${WEB_READY_TIMEOUT}s)…"
+info "Waiting for web app on host port ${WEB_HOST_PORT} (timeout ${WEB_READY_TIMEOUT}s)…"
 WEB_ELAPSED=0
 WEB_READY=false
-until curl -sf -o /dev/null "http://localhost:${WEB_PORT}/login"; do
+until curl -sf -o /dev/null "http://localhost:${WEB_HOST_PORT}/login"; do
     WEB_ELAPSED=$((WEB_ELAPSED + 2))
     if [[ ${WEB_ELAPSED} -ge ${WEB_READY_TIMEOUT} ]]; then
         echo ""
@@ -180,15 +226,15 @@ until curl -sf -o /dev/null "http://localhost:${WEB_PORT}/login"; do
 done
 echo ""
 WEB_READY=true
-ok "${WEB_CONTAINER} READY on http://localhost:${WEB_PORT}"
+ok "${WEB_CONTAINER} READY on http://localhost:${WEB_HOST_PORT}"
 
 # ---------------------------------------------------------------------------
 # Step 7 — Health-check MCP (up to MCP_READY_TIMEOUT seconds)
 # ---------------------------------------------------------------------------
-info "Waiting for MCP server on port ${MCP_PORT} (timeout ${MCP_READY_TIMEOUT}s)…"
+info "Waiting for MCP server on host port ${MCP_HOST_PORT} (timeout ${MCP_READY_TIMEOUT}s)…"
 MCP_ELAPSED=0
 MCP_READY=false
-until curl -sf -o /dev/null "http://localhost:${MCP_PORT}/"; do
+until curl -sf -o /dev/null "http://localhost:${MCP_HOST_PORT}/"; do
     MCP_ELAPSED=$((MCP_ELAPSED + 2))
     if [[ ${MCP_ELAPSED} -ge ${MCP_READY_TIMEOUT} ]]; then
         echo ""
@@ -202,7 +248,7 @@ until curl -sf -o /dev/null "http://localhost:${MCP_PORT}/"; do
 done
 echo ""
 MCP_READY=true
-ok "${MCP_CONTAINER} READY on http://localhost:${MCP_PORT}"
+ok "${MCP_CONTAINER} READY on http://localhost:${MCP_HOST_PORT}"
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -213,11 +259,16 @@ echo -e "${_BOLD}${_GREEN}  SETUP COMPLETE — READY${_RESET}"
 echo -e "${_BOLD}${_GREEN}================================================================${_RESET}"
 echo "  Pinned commit : ${PINNED_COMMIT}"
 echo "  Pinned image  : ${PINNED_IMAGE}"
-echo "  Web           : http://localhost:${WEB_PORT}   (${WEB_CONTAINER})"
-echo "  MCP           : http://localhost:${MCP_PORT}   (${MCP_CONTAINER})"
+echo "  Web           : http://localhost:${WEB_HOST_PORT}   (${WEB_CONTAINER})"
+echo "  MCP           : http://localhost:${MCP_HOST_PORT}   (${MCP_CONTAINER})"
 echo "  Mock server   : http://localhost:${MOCK_PORT}  (host, PID ${MOCK_PID})"
 echo "  Canary token  : $(cat "${AUDIT_STATE_DIR}/canary.txt" 2>/dev/null || echo 'NOT YET WRITTEN')"
 echo ""
+if [[ "${WEB_HOST_PORT}" != "3000" || "${MCP_HOST_PORT}" != "8788" ]]; then
+echo "  NON-DEFAULT PORTS — run exploits with matching bases:"
+echo "    WEB_BASE=http://localhost:${WEB_HOST_PORT} MCP_BASE=http://localhost:${MCP_HOST_PORT} bash autofyn_audit/run_exploits.sh"
+else
 echo "  Run exploits  : bash autofyn_audit/run_exploits.sh"
+fi
 echo "  Teardown      : bash autofyn_audit/teardown.sh"
 echo -e "${_BOLD}${_GREEN}================================================================${_RESET}"
