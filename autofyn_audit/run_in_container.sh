@@ -39,6 +39,7 @@ severity_for() {
         *exploit_03*) echo "REFUTED" ;;
         *exploit_04*) echo "MEDIUM"  ;;
         *exploit_05*) echo "INFO"    ;;
+        *exploit_06*) echo "INFO"    ;;
         *)            echo "UNKNOWN" ;;
     esac
 }
@@ -51,6 +52,7 @@ title_for() {
         *exploit_03*) echo "C3 — REFUTED: /api/onboarding/extract-content is auth-gated" ;;
         *exploit_04*) echo "C4 — MCP host-header OAuth metadata injection" ;;
         *exploit_05*) echo "C5 — Next.js middleware RSC/prefetch auth bypass" ;;
+        *exploit_06*) echo "C6 — npm name 'supermemory-mcp' unclaimed (dep-confusion precondition)" ;;
         *)            echo "$(basename "${name}" .sh)" ;;
     esac
 }
