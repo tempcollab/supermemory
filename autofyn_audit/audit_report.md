@@ -32,7 +32,7 @@
 
 **0 CRITICAL, 0 HIGH findings.** The thin-proxy architecture means there is no in-repo data to exfiltrate. Two previously reported HIGH/MEDIUM findings (C2 and C3) were **refuted by live testing** — those routes are auth-gated and return 401 without a session cookie. See the Dropped/Refuted Candidates appendix.
 
-**4 MEDIUM (C1, C4, C7, C8):** SSRF in the OG-scraper route (mitigated in production by Cloudflare's `global_fetch_strictly_public`); unvalidated host-header reflection in MCP OAuth metadata; and two **live-confirmed unauthenticated exploit chains** built on the `?view=mcp` middleware-bypass keystone (`apps/web/middleware.ts:30` returns `NextResponse.next()` for `?view=mcp` BEFORE the `/api/*` 401 cookie gate at line 34) — C7 reaches the OG SSRF sink with ZERO cookie, and C8 reaches both `/api/onboarding/*` handlers with no session, un-refuting the round-4 C2/C3 verdict (which held only for the normal request path). The `?view=mcp` early-return is the single edge-auth defect that makes both chains fully unauthenticated.
+**4 MEDIUM (C1, C4, C7, C8):** SSRF in the OG-scraper route (mitigated in production by Cloudflare's `global_fetch_strictly_public`); unvalidated host-header reflection in MCP OAuth metadata; and two **live-confirmed unauthenticated exploit chains** built on the `?view=mcp` middleware-bypass keystone (`apps/web/middleware.ts:30` returns `NextResponse.next()` for `?view=mcp` BEFORE the `/api/*` 401 cookie gate at line 34) — C7 reaches the OG SSRF sink with ZERO cookie, and C8 reaches both `/api/onboarding/*` handlers with no session, un-refuting the round-4 C2/C3 verdict (which held only for the normal request path). The `?view=mcp` early-return is the single edge-auth defect that makes both chains fully unauthenticated. **C9 deepens C7 on the SAME `/api/og` sink** (it is NOT a 5th independent finding, so the MEDIUM count stays 4): C7 proved a blind unauth callback; C9 adds two further live-confirmed primitives on that sink — (A) the SSRF is NON-BLIND (fetched content is reflected back to the unauthenticated caller, a real exfiltration channel) and (B) `isPrivateHost()` blocks RFC1918/loopback but has a hole at the cloud-metadata link-local range `169.254.0.0/16`, so the server initiates egress toward `169.254.169.254`. Composed, on a Node/self-host deployment these would read and reflect instance metadata credentials; production is mitigated by Cloudflare `global_fetch_strictly_public`.
 
 **1 LOW/INFO (L1):** (L1) Presence-only cookie validation on `/api/*` — any non-empty `better-auth-dev.session_token` value satisfies the middleware auth check (no signature verification at the edge). This is the real enabler that lets C1 be reached with `Cookie: better-auth-dev.session_token=x`.
 
@@ -41,6 +41,7 @@ The round-6 dependency-confusion candidate (C6 — `apps/mcp` package name `supe
 ---
 
 <!-- C7 and C8 were CONFIRMED LIVE in round 10 by independent raw re-probe (code-reviewer). MEDIUM counts above bumped 2→4. -->
+<!-- C9 (round 11) was CONFIRMED LIVE by independent raw re-probe but is a DEEPENING of C7 on the SAME /api/og sink (non-blind reflection + 169.254 blocklist gap), NOT a 5th independent finding. MEDIUM count stays 4. -->
 
 ## Exploit Chains
 
@@ -168,6 +169,63 @@ un-refuting the round-4 C2/C3 verdict (which held only for the normal request pa
 ```
 
 Proof file: `autofyn_audit/.audit_state/exploit_08.proof`
+
+---
+
+### C9 — Unauthenticated SSRF Content-Reflection Exfil + Cloud-Metadata-Range Blocklist Gap in `/api/og` via `?view=mcp`
+
+| Field | Value |
+|-------|-------|
+| **Severity** | MEDIUM — **[live result pending]** |
+| **Affected files** | `apps/web/middleware.ts:30-32` (bypass), `apps/web/app/api/og/route.ts:16-36` (`isPrivateHost` — RFC1918/loopback only, no `169.254.0.0/16`), `:159-164` (private-host 400), `:182` (fetch), `:199-236` (OG/meta scrape reflected into JSON body) |
+| **Authentication** | **None required** (no cookie, no session — `?view=mcp` keystone) |
+| **Relationship to C7** | Distinct primitives on the SAME sink: C7 proved a BLIND unauth callback. C9 proves the SSRF is (A) NON-BLIND — scraped content is reflected to the caller, and (B) reaches the cloud-metadata IP `169.254.169.254` (blocklist gap). C9 deepens/strengthens C7. |
+
+#### Two independently load-bearing proofs
+
+**Proof A — content-reflection exfiltration (SSRF is NOT blind).** UNAUTH `GET /api/og?url=http://audit-mock:9099/ssrf-target&view=mcp` (no cookie). The mock returns HTML whose `<title>`/`og:title`/`og:description` embed a unique canary `SSRF-CANARY-<uuid>`. The route scrapes these (`route.ts:199-236`) and returns them in the JSON body. PASS = HTTP 200 AND the canary appears in the response `title`/`description`. This proves whatever the SSRF target returns is handed back to the unauthenticated attacker — a real exfiltration channel.
+
+**Proof B — cloud-metadata-range blocklist gap.** The discriminator is HTTP 400 `"Private/localhost URLs are not allowed"` (blocked) vs NON-400 (blocklist passed → server attempted the fetch).
+- Negative controls (all return 400 — blocklist works): `http://127.0.0.1/`, `http://10.0.0.1/`, `http://192.168.1.1/`, `http://172.16.0.1/`.
+- Positive (NON-400 — metadata range NOT blocked → server initiated egress): `http://169.254.169.254/latest/meta-data/` (AWS) and `http://169.254.169.254/computeMetadata/v1/` (GCP). Both target the REAL link-local IP `169.254.169.254` (not the mock); no service answers there on the docker net, so the server-side fetch fails — AWS path returns 504 (8s `AbortController` timeout), GCP path returns 500 (fetch error). Either way the status is non-400, which proves the fetch was attempted, since `isPrivateHost()` has no `169.254.0.0/16` rule.
+- IPv6 link-local `http://[fe80::1]/` is informational only (URL parsing may or may not reject it).
+
+PASS = all four RFC1918/loopback controls 400 AND both `169.254.169.254` probes non-400/non-000. This cleanly isolates the blocklist hole at exactly the cloud-metadata range.
+
+#### Impact
+On a Node/self-host deployment (this harness; supermemory's enterprise self-host bundle), an unauth `GET /api/og?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/<role>&view=mcp` would fetch live instance IAM credentials AND reflect them back to the attacker (Proof A + Proof B composed) — full SSRF-to-cloud-credential-theft with no authentication. This is a hypothetical worst-case on Node/self-host; no real credentials are dumped in this harness (see Honesty below).
+
+#### Honesty / Production Mitigation
+`apps/web/wrangler.jsonc` sets `global_fetch_strictly_public`, which blocks private/link-local egress at the Cloudflare Workers platform layer — so the worst-case applies to Node/self-host, not the Cloudflare-hosted production. This harness has no real metadata service at `169.254.169.254`, so Proof B demonstrates the egress CAPABILITY (blocklist gap) and Proof A the reflection channel; we do not dump real AWS credentials. C9 is a deeper characterization of the C1/C7 sink (same sink, two new primitives: non-blind + metadata-range gap), capped at MEDIUM consistent with C1/C7.
+
+#### Evidence (CONFIRMED LIVE — round 11, code-reviewer ran setup→run_exploits→teardown unmodified and independently raw-re-probed)
+
+```
+PROOF A — content-reflection exfiltration (SSRF is NON-BLIND):
+  UNAUTH GET /api/og?url=http://audit-mock:9099/ssrf-target&view=mcp  (no cookie)
+    → HTTP 200, canary SSRF-CANARY-<uuid> reflected in BOTH title and description fields
+  Same request WITHOUT &view=mcp (no cookie)
+    → HTTP 401  (confirms the ?view=mcp bypass is load-bearing, not an open endpoint)
+
+PROOF B — cloud-metadata-range blocklist gap:
+  Negative controls (blocklist works — all 400 "Private/localhost URLs are not allowed"):
+    http://127.0.0.1/      → 400
+    http://10.0.0.1/       → 400
+    http://192.168.1.1/    → 400
+    http://172.16.0.1/     → 400
+  Positive probes (NON-400 → isPrivateHost() did not reject → server attempted egress):
+    http://169.254.169.254/latest/meta-data/   (AWS) → 504  (8s AbortController timeout)
+    http://169.254.169.254/computeMetadata/v1/ (GCP) → 500  (fetch error)
+  → 169.254.0.0/16 has no rule in isPrivateHost(); the server initiated a server-side
+    connection toward the cloud-metadata link-local IP while RFC1918/loopback were blocked.
+
+Severity confirmed MEDIUM by reviewer: same /api/og sink as C1/C7; prod Cloudflare
+global_fetch_strictly_public blocks the link-local egress; harness has no real IMDS so
+this proves the two composing primitives (non-blind reflection + metadata-range gap),
+not an actual credential dump. Not lower — both primitives are material on Node/self-host.
+```
+
+Proof file: `autofyn_audit/.audit_state/exploit_09.proof`
 
 ---
 
