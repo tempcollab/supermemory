@@ -24,7 +24,7 @@
 |----------|-------|
 | CRITICAL | 0     |
 | HIGH     | 0     |
-| MEDIUM   | 2     |
+| MEDIUM   | 4     |
 | LOW/INFO | 1     |
 
 <!-- C5 (RSC/prefetch middleware bypass) was REFUTED live in round 5 — every variant stayed 307-gated. It adds no severity; counts above are unchanged. See the C5 section and Dropped/Refuted appendix. -->
@@ -32,11 +32,142 @@
 
 **0 CRITICAL, 0 HIGH findings.** The thin-proxy architecture means there is no in-repo data to exfiltrate. Two previously reported HIGH/MEDIUM findings (C2 and C3) were **refuted by live testing** — those routes are auth-gated and return 401 without a session cookie. See the Dropped/Refuted Candidates appendix.
 
-**2 MEDIUM (C1, C4):** SSRF in the OG-scraper route (mitigated in production by Cloudflare's `global_fetch_strictly_public`), and unvalidated host-header reflection in MCP OAuth metadata.
+**4 MEDIUM (C1, C4, C7, C8):** SSRF in the OG-scraper route (mitigated in production by Cloudflare's `global_fetch_strictly_public`); unvalidated host-header reflection in MCP OAuth metadata; and two **live-confirmed unauthenticated exploit chains** built on the `?view=mcp` middleware-bypass keystone (`apps/web/middleware.ts:30` returns `NextResponse.next()` for `?view=mcp` BEFORE the `/api/*` 401 cookie gate at line 34) — C7 reaches the OG SSRF sink with ZERO cookie, and C8 reaches both `/api/onboarding/*` handlers with no session, un-refuting the round-4 C2/C3 verdict (which held only for the normal request path). The `?view=mcp` early-return is the single edge-auth defect that makes both chains fully unauthenticated.
 
 **1 LOW/INFO (L1):** (L1) Presence-only cookie validation on `/api/*` — any non-empty `better-auth-dev.session_token` value satisfies the middleware auth check (no signature verification at the edge). This is the real enabler that lets C1 be reached with `Cookie: better-auth-dev.session_token=x`.
 
 The round-6 dependency-confusion candidate (C6 — `apps/mcp` package name `supermemory-mcp`) was **REFUTED live**: the name is already published on public npm by an unrelated third party (HTTP 200), so the "unclaimed name" precondition does not hold. A separate HIGH-by-inspection CI finding (`claude.yml` external `@claude` → `Bash(*)`+`SUPERMEMORY_API_KEY` exposure) is documented in the STATIC-ONLY appendix under Supply-Chain and is NOT included in the live-confirmed counts above (it requires attacking the real GitHub repo, out of scope for this harness).
+
+---
+
+<!-- C7 and C8 were CONFIRMED LIVE in round 10 by independent raw re-probe (code-reviewer). MEDIUM counts above bumped 2→4. -->
+
+## Exploit Chains
+
+These chains combine the `?view=mcp` middleware bypass (keystone: `middleware.ts:29-32`) with previously-identified sinks to demonstrate end-to-end unauthenticated impact.
+
+---
+
+### C7 — Unauthenticated SSRF in `/api/og` via `?view=mcp` Middleware Bypass
+
+| Field | Value |
+|-------|-------|
+| **Severity** | MEDIUM — **CONFIRMED LIVE** (round 10) |
+| **Affected files** | `apps/web/middleware.ts:29-32` (bypass), `apps/web/app/api/og/route.ts:16-36` (`isPrivateHost`), `:182` (fetch) |
+| **Authentication** | **None required** (the whole point — no cookie, no session) |
+| **Relationship to C1** | Strengthens C1: same SSRF sink, now reachable with ZERO cookie (fully unauthenticated) |
+
+#### Attack Chain
+
+**Precondition:** Web app running on `next dev` (Node.js). No session cookie.
+
+**Step 1 — Bypass:** Attacker sends:
+```
+GET /api/og?url=<target-URL>&view=mcp
+```
+The middleware (`middleware.ts`) calls `getPublicRequestUrl(request)` (line 14) which preserves the inbound query string including `view`. At line 30, `url.searchParams.get("view") === "mcp"` is true, so the middleware executes:
+```typescript
+// MCP setup page is public — no auth required
+if (url.searchParams.get("view") === "mcp") {
+    return NextResponse.next()
+}
+```
+This `NextResponse.next()` fires **before** the `/api/*` 401 gate at lines 34-40:
+```typescript
+if (url.pathname.startsWith("/api/")) {
+    if (!sessionCookie) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+```
+The auth check is never reached.
+
+**Step 2 — SSRF fires:** The `/api/og` handler runs unauthenticated. At `route.ts:182` it executes `fetch(trimmedUrl, ...)` where `trimmedUrl` is the attacker-supplied `url` query parameter. `isPrivateHost()` (`:16-36`) validates only the literal hostname string — it blocks `localhost`, `127.*`, `0.0.0.0`, and RFC-1918 IP prefixes, but misses DNS names like `audit-mock` (a docker-network container name that resolves to an internal IP at the OS level, bypassing the string check).
+
+**Impact:** Unauthenticated server-side fetch to attacker-controlled URL. Internal-network hosts reachable by DNS name. On cloud: IMDS (`169.254.169.254`) reachable (504 proves fetch attempted, no `169.254.*` rule in `isPrivateHost()`).
+
+#### Honesty / Production Mitigation
+
+`apps/web/wrangler.jsonc` sets `global_fetch_strictly_public` (Cloudflare Workers compatibility flag) which blocks private/link-local egress at the Workers runtime level. **Production impact is largely mitigated.** The MEDIUM severity reflects the dev/Node ceiling — the same ceiling as C1. C7 is meaningful as an escalation over C1 (removes the dummy-cookie precondition) but does not change production severity.
+
+#### Evidence (live-confirmed, round 10 — independent raw re-probe over `autofyn-audit-net`)
+
+```
+Baseline (NO cookie, NO view param):
+  GET /api/og?url=http://audit-mock:9099/ssrf-target-c7   → HTTP 401  (gate present)
+
+Bypass (NO cookie, with &view=mcp):
+  GET /api/og?url=http://audit-mock:9099/ssrf-target-c7&view=mcp   → HTTP 200
+  Response body reflects the OG canary scraped from the mock target.
+
+Server-side fetch proof — mock /__hits recorded:
+  GET /ssrf-target-c7
+  User-Agent: Mozilla/5.0 (compatible; SuperMemory/1.0; +https://supermemory.ai)
+  (the UA hardcoded at og/route.ts:185-186 — i.e. the WEB SERVER made the
+   outbound fetch, not the attacker's curl client)
+
+=> 401 → 200 with ZERO cookie + server-side fetch fired = UNAUTHENTICATED SSRF confirmed.
+```
+
+Proof file: `autofyn_audit/.audit_state/exploit_07.proof`
+
+---
+
+### C8 — Unauthenticated Reach of `/api/onboarding/*` via `?view=mcp` Middleware Bypass
+
+| Field | Value |
+|-------|-------|
+| **Severity** | MEDIUM — **CONFIRMED LIVE** (round 10) |
+| **Affected files** | `apps/web/middleware.ts:29-32` (bypass), `apps/web/app/api/onboarding/research/route.ts:85-95` (prompt injection surface), `apps/web/app/api/onboarding/extract-content/route.ts:21-26,44-55` (Exa key-guard + fetch) |
+| **Authentication** | **None required** |
+| **Relationship to C2/C3** | Un-refutes round-4 C2/C3 — those routes ARE reachable with no cookie via the `?view=mcp` bypass |
+
+#### Attack Chain
+
+**Precondition:** Web app on `next dev`. No session cookie. No `XAI_API_KEY` or `EXA_API_KEY` in the default audit environment (keys are optional).
+
+**Step 1 — Bypass (same keystone as C7):** Append `?view=mcp` to either route. The `?view=mcp` early-return (`middleware.ts:30-31`) fires before the `/api/*` 401 gate.
+
+**Step 2A — research route handler runs:** `POST /api/onboarding/research?view=mcp` reaches the handler. The handler constructs a Grok prompt with attacker-controlled `name` and `email` fields interpolated verbatim (`route.ts:85-95`):
+```typescript
+const contextParts: string[] = []
+if (name) contextParts.push(`Name: ${name}`)
+if (email) contextParts.push(`Email: ${email}`)
+const userContext =
+    contextParts.length > 0
+        ? `\n\nAdditional context about the user:\n${contextParts.join("\n")}`
+        : ""
+```
+With an invalid handle, the handler returns a clean **400** (`route.ts:78-83`, the `^[A-Za-z0-9_]{1,15}$` validation path — a status the middleware can never produce, so it unambiguously proves the handler ran). With a valid handle and `XAI_API_KEY` set: attacker-controlled name/email reach the paid xAI Grok model (cost abuse + prompt-injection surface). The **401→400** status flip is the handler-reachability proof. (Note: a generic 500 is NOT used as proof — the route returns a catch-all 500 for many error paths, so 400 is the discriminating handler-only signal.)
+
+**Step 2B — extract-content route handler runs:** `POST /api/onboarding/extract-content?view=mcp` reaches the handler. Without `EXA_API_KEY`, the key-guard at `route.ts:21-26` fires immediately (before `req.json()`), returning 503. With key: attacker-supplied `urls[]` are forwarded to the paid Exa API (`route.ts:44-55`). The 401→503 flip proves the handler ran without a cookie.
+
+**Impact:** Unauth access to paid upstream AI/Exa calls (cost abuse), and a prompt-injection surface in the research route where attacker-controlled `name`/`email` are interpolated verbatim into a Grok LLM prompt. Without upstream keys in the audit instance the observable impact is handler-reachability only (500/503). With keys the paid-call-and-injection chain lands.
+
+#### Honesty
+
+Without upstream keys (`XAI_API_KEY` / `EXA_API_KEY`) the proof is bounded to **handler-reachability** (500/503 status flips), NOT a completed paid call or data exfiltration. Severity is MEDIUM, tied to observed behavior.
+
+#### Evidence (live-confirmed, round 10 — independent raw re-probe over `autofyn-audit-net`)
+
+```
+PART A — /api/onboarding/research (NO cookie):
+  Baseline (no view param):  POST /api/onboarding/research                → HTTP 401
+  Bypass (with ?view=mcp):   POST /api/onboarding/research?view=mcp        → HTTP 400
+      body: {"xUrl":"@@@invalid handle@@@","name":"AUTOFYN-INJECT-…","email":"…"}
+      response: "Could not parse a valid X/Twitter handle" (handler-only validation path)
+  => 401 → 400 = handler reached unauthenticated.
+
+PART B — /api/onboarding/extract-content (NO cookie):
+  Baseline (no view param):  POST /api/onboarding/extract-content          → HTTP 401
+  Bypass (with ?view=mcp):   POST /api/onboarding/extract-content?view=mcp → HTTP 503
+      response: "Content extraction is unavailable" (no-EXA-key handler guard, route.ts:21-26)
+  => 401 → 503 = handler reached unauthenticated.
+
+Both onboarding handlers run with NO session cookie via the ?view=mcp bypass —
+un-refuting the round-4 C2/C3 verdict (which held only for the normal request path).
+```
+
+Proof file: `autofyn_audit/.audit_state/exploit_08.proof`
 
 ---
 
@@ -579,6 +710,8 @@ Status:   400  {"error":"Could not parse a valid X/Twitter handle from the input
 
 **Status:** Investigated, REFUTED against live instance — route is auth-gated (401 without session cookie). The static-analysis claim was incorrect.
 
+> **Round-8 update:** The round-4 refutation was scoped to *401-without-cookie via the normal request path*. The `?view=mcp` middleware bypass (see C8) re-opens unauthenticated reachability — re-evaluated this round. The routes WERE correctly gated without the bypass; C8 demonstrates the bypass route.
+
 ---
 
 ### REFUTED: C3 — `/api/onboarding/extract-content` (previously MEDIUM)
@@ -598,6 +731,8 @@ Body:     {"error":"Unauthorized"}      <-- auth-gated, not 503
 **Why the static analysis was wrong:** Same root cause as C2. The `onboarding` exclusion in the matcher does not apply to `/api/onboarding/*` paths.
 
 **Status:** Investigated, REFUTED against live instance — route is auth-gated (401 without session cookie). The static-analysis claim was incorrect.
+
+> **Round-8 update:** The round-4 refutation was scoped to *401-without-cookie via the normal request path*. The `?view=mcp` middleware bypass (see C8) re-opens unauthenticated reachability — re-evaluated this round. The routes WERE correctly gated without the bypass; C8 demonstrates the bypass route.
 
 ---
 

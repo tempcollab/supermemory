@@ -40,6 +40,8 @@ severity_for() {
         *exploit_04*) echo "MEDIUM"  ;;
         *exploit_05*) echo "INFO"    ;;
         *exploit_06*) echo "INFO"    ;;
+        *exploit_07*) echo "MEDIUM"  ;;
+        *exploit_08*) echo "MEDIUM"  ;;
         *)            echo "UNKNOWN" ;;
     esac
 }
@@ -53,6 +55,8 @@ title_for() {
         *exploit_04*) echo "C4 — MCP host-header OAuth metadata injection" ;;
         *exploit_05*) echo "C5 — Next.js middleware RSC/prefetch auth bypass" ;;
         *exploit_06*) echo "C6 — npm name 'supermemory-mcp' unclaimed (dep-confusion precondition)" ;;
+        *exploit_07*) echo "C7 — UNAUTH /api/og SSRF via ?view=mcp bypass" ;;
+        *exploit_08*) echo "C8 — UNAUTH /api/onboarding/* reach via ?view=mcp bypass" ;;
         *)            echo "$(basename "${name}" .sh)" ;;
     esac
 }
