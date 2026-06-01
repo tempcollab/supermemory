@@ -38,6 +38,7 @@ severity_for() {
         *exploit_02*) echo "REFUTED" ;;
         *exploit_03*) echo "REFUTED" ;;
         *exploit_04*) echo "MEDIUM"  ;;
+        *exploit_05*) echo "INFO"    ;;
         *)            echo "UNKNOWN" ;;
     esac
 }
@@ -49,6 +50,7 @@ title_for() {
         *exploit_02*) echo "C2 — REFUTED: /api/onboarding/research is auth-gated" ;;
         *exploit_03*) echo "C3 — REFUTED: /api/onboarding/extract-content is auth-gated" ;;
         *exploit_04*) echo "C4 — MCP host-header OAuth metadata injection" ;;
+        *exploit_05*) echo "C5 — Next.js middleware RSC/prefetch auth bypass" ;;
         *)            echo "$(basename "${name}" .sh)" ;;
     esac
 }

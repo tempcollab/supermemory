@@ -27,6 +27,8 @@
 | MEDIUM   | 2     |
 | LOW/INFO | 1     |
 
+<!-- C5 (RSC/prefetch middleware bypass) was REFUTED live in round 5 — every variant stayed 307-gated. It adds no severity; counts above are unchanged. See the C5 section and Dropped/Refuted appendix. -->
+
 **0 CRITICAL, 0 HIGH findings.** The thin-proxy architecture means there is no in-repo data to exfiltrate. Two previously reported HIGH/MEDIUM findings (C2 and C3) were **refuted by live testing** — those routes are auth-gated and return 401 without a session cookie. See the Dropped/Refuted Candidates appendix.
 
 **2 MEDIUM (C1, C4):** SSRF in the OG-scraper route (mitigated in production by Cloudflare's `global_fetch_strictly_public`), and unvalidated host-header reflection in MCP OAuth metadata.
@@ -231,6 +233,104 @@ Proof file: `autofyn_audit/.audit_state/exploit_04.proof`
 
 ---
 
+### C5 — REFUTED: Next.js Middleware Auth-Gate Bypass via RSC / Segment-Prefetch Request
+
+| Field | Value |
+|-------|-------|
+| **Severity** | **REFUTED** (live-tested round 5 — every RSC/segment-prefetch variant stayed gated; not reproducible) |
+| **Affected file** | `apps/web/middleware.ts:80-84` (matcher); rendered page `apps/web/app/(app)/settings/page.tsx` |
+| **Version fact** | Next.js `16.1.6` (`bun.lock:3899`) |
+| **Authentication** | None (the test sends NO session cookie) |
+
+#### Outcome: REFUTED
+
+**This finding did NOT reproduce live.** The hypothesis below was tested against the
+live instance in round 5 and refuted: the middleware gate held for every RSC /
+segment-prefetch request shape. It is documented here for transparency and to
+record the variants tested.
+
+#### Hypothesis (refuted)
+
+The web app's only edge auth gate is the Next.js middleware (`middleware.ts`). It
+runs for any path NOT in the matcher negative-lookahead (`middleware.ts:82`) and,
+for a protected page with no session cookie, redirects to `/login`
+(`middleware.ts:47-54`). The hypothesis was that on the App Router, certain RSC /
+segment-prefetch request shapes (`Rsc: 1` / `Next-Router-Prefetch: 1` headers, a
+`?_rsc=` query, or a `.rsc` segment path) might, on some Next.js versions, cause
+the framework to serve the route's React-flight payload WITHOUT invoking the
+middleware matcher — bypassing the cookie-presence gate.
+
+We chose `/settings` as the protected page: it is NOT in the matcher exclusion list
+(so middleware runs) and is not public, so without a cookie it normally redirects
+to `/login`.
+
+> **No CVE identifier is asserted.** This finding is framed on OBSERVED LIVE
+> BEHAVIOR plus the version fact. It is consistent with a known Next.js
+> middleware-bypass class; maintainers should consult Next.js security advisories
+> for the 16.1.x line.
+
+#### Reproduction
+
+```bash
+bash autofyn_audit/exploits/exploit_05_middleware_rsc_bypass.sh
+```
+
+Baseline (gated):
+```
+GET http://autofyn-web:3000/settings        # no cookie -> 3xx redirect to /login
+```
+Bypass attempt (one of several variants):
+```
+GET http://autofyn-web:3000/settings  -H "Rsc: 1" -H "Next-Router-Prefetch: 1"
+GET http://autofyn-web:3000/settings?_rsc=0001a
+GET http://autofyn-web:3000/settings.rsc
+```
+
+#### Evidence
+
+```
+Baseline:  GET /settings (no cookie)                          -> 307  Location: /login?redirect=.../settings  (GATED)
+
+Variants (no cookie), all REFUTED:
+  GET /settings  -H "Rsc: 1"                                  -> 307  -> /login
+  GET /settings  -H "Rsc: 1" -H "Next-Router-Prefetch: 1"     -> 307  -> /login
+  GET /settings?_rsc=0001a                                    -> 307  -> /login
+  GET /settings?_rsc=0001a -H "Rsc: 1" -H "Next-Router-Prefetch: 1" -> 307 -> /login
+  GET /settings.rsc                                           -> 307  -> /login
+
+Bypass confirmed:                NO
+RSC payload server-data present: N/A (no 200 ever returned)
+```
+Independent raw re-probe (reviewer, outside the harness) returned 307 for the
+baseline and every RSC-shaped variant, confirming the gate holds. The middleware
+runs ahead of RSC request handling, so RSC/prefetch headers, `?_rsc=` query, and
+`.rsc` paths do not skip the matcher on Next.js 16.1.6.
+
+Proof file: `autofyn_audit/.audit_state/exploit_05.proof`
+
+#### Impact
+
+None — the bypass did not reproduce. For completeness: even had it succeeded,
+`apps/web/app/(app)/settings/page.tsx` is a `"use client"` component (verified,
+line 1) with no server-side data fetching, so a bypassed payload would have been
+an empty client-bundle RSC shell — route structure, NOT user data — capping any
+hypothetical severity at LOW/INFO. Because the gate held, this candidate is
+**refuted** and carries no severity (treated like C2/C3).
+
+#### Mitigating Factors
+
+- All protected pages audited are `"use client"` shells — no in-repo server data
+  to exfiltrate via the bypassed payload.
+- Real session validation occurs downstream at `api.supermemory.ai` (out of scope).
+
+#### Recommendation
+
+Upgrade Next.js to a patched **16.2.x** release. Do not rely on the middleware
+matcher as the sole authorization boundary; enforce auth in route handlers /
+server components as well.
+
+---
+
 ### L1 — Presence-Only Cookie Validation on `/api/*` (LOW/INFO)
 
 | Field | Value |
@@ -347,6 +447,69 @@ Body:     {"error":"Unauthorized"}      <-- auth-gated, not 503
 | Unbounded `fetch-graph-data` limit, browser-extension postMessage/token storage | Require external backend with valid API key, or are client-side LOW findings. Not live-confirmable in this repo scope. |
 | Workers-oauth-provider issues | Third-party library; in-scope only if a CVE is attributable to the repo's usage, which was not established. |
 | C1 decimal-IP bypass (`http://2130706433/`) | BLOCKED live — Bun/Node normalises hostname to 127.0.0.1, which is caught by `isPrivateHost()`'s `startsWith("127.")` check. Returns 400. Sub-claim withdrawn. |
+| C5 — Next.js middleware RSC/segment-prefetch auth bypass | REFUTED live (round 5). Baseline `/settings` and all RSC-shaped variants (`Rsc:1`/`Next-Router-Prefetch:1` headers, `?_rsc=`, `.rsc` path) returned **307 → /login**. Middleware runs ahead of RSC handling on Next.js 16.1.6; no 200/flight payload ever served. See C5 section for full evidence. |
+
+---
+
+### STATIC-ONLY (not live-confirmed): Browser-Extension postMessage Token Overwrite
+
+**Status:** STATIC ANALYSIS ONLY — NOT live-confirmed. Confirming this requires a
+loaded browser extension PLUS a pre-existing XSS on `app.supermemory.ai`; neither
+is reproducible in this headless HTTP harness. Listed for completeness, not counted
+among the live-confirmed findings.
+
+**Severity (standalone):** LOW. (Potentially HIGH only if chained with an
+independent XSS on the web app — which we did not find.)
+
+**File:** `apps/browser-extension/entrypoints/content/shared.ts:98-128`
+
+**Real code:**
+```typescript
+window.addEventListener("message", async (event) => {
+    if (event.source !== window) {
+        return
+    }
+    const token = event.data.token
+    const user = event.data.userData
+    if (token && user) {
+        if (
+            !(
+                window.location.hostname === "localhost" ||
+                window.location.hostname === "supermemory.ai" ||
+                window.location.hostname === "app.supermemory.ai"
+            )
+        ) {
+            console.log("Bearer token and user data is only allowed to be used on localhost or supermemory.ai")
+            return
+        }
+        try {
+            await Promise.all([
+                bearerToken.setValue(token),
+                userData.setValue(user),
+            ])
+        } catch {
+            // Do nothing
+        }
+    }
+})
+```
+
+**Issue:** The guard validates `window.location.hostname` (the content script's HOST
+PAGE hostname) and `event.source !== window` (same browsing context), but NOT
+`event.origin` of the message sender. Any script executing in the page context of
+`app.supermemory.ai` (e.g. via a stored XSS there) can call
+`window.postMessage({ token: "attacker_token", userData: {...} }, "*")` and overwrite
+the victim's stored extension bearer token in `chrome.storage.local`. This is a
+token-REPLACEMENT (confused-deputy) issue, not token exfiltration — the existing
+token never flows back over postMessage. After replacement, the victim's saved
+content is directed to the attacker's account.
+
+**Why not live-confirmed:** Requires (a) the extension loaded in a browser and
+(b) script execution on `app.supermemory.ai`. The audit harness is headless HTTP
+only; we did not find an independent XSS on the web app to chain.
+
+**Recommendation:** Validate `event.origin` against an exact allowlist (e.g.
+`https://app.supermemory.ai`) in addition to the existing checks.
 
 ---
 
