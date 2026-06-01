@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# setup.sh — Build the audit image, start the web+mcp containers, and start
-# the mock server on the host.
+# setup.sh — Resolve the pre-built audit image, start the web+mcp containers,
+# and start the mock server on the host.
+#
+# This script does NOT build the Docker image. Build it once (and only once)
+# before the first run with:
+#   bash autofyn_audit/build_image.sh
+#
+# After that, setup.sh reuses the pinned local image autofyn-audit:pinned
+# without rebuilding. To use a registry image instead, set AUDIT_IMAGE:
+#   AUDIT_IMAGE=ghcr.io/your-org/autofyn-audit:pinned bash autofyn_audit/setup.sh
 #
 # Prerequisites: docker, git, python3, curl
 #
 # Usage: bash autofyn_audit/setup.sh
-#        bash autofyn_audit/setup.sh --no-cache   (force image rebuild)
 #
 # Host-port overrides (use when ports 3000/8788 are already taken on the host):
 #        WEB_HOST_PORT=3001 MCP_HOST_PORT=8789 bash autofyn_audit/setup.sh
@@ -39,11 +46,6 @@ AUDIT_STATE_DIR="${SCRIPT_DIR}/.audit_state"
 
 WEB_READY_TIMEOUT=180   # seconds — next dev first build is slow
 MCP_READY_TIMEOUT=120   # seconds
-
-NO_CACHE_FLAG=""
-for arg in "$@"; do
-    [[ "${arg}" == "--no-cache" ]] && NO_CACHE_FLAG="--no-cache"
-done
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -115,18 +117,44 @@ for p in "${WEB_HOST_PORT}" "${MCP_HOST_PORT}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 2 — Build audit image (reuse if already present and --no-cache not given)
+# Step 2 — Resolve the pre-built audit image (NO inline build)
 # ---------------------------------------------------------------------------
-info "Building audit image: ${IMAGE_TAG}  (base: ${PINNED_IMAGE})"
-info "Build context: ${REPO_ROOT}  — see autofyn_audit/.dockerignore for exclusions"
-info "Expected first-build time: 3-6 minutes (bun install on full monorepo)"
-docker build \
-    ${NO_CACHE_FLAG} \
-    --build-arg "EXPECTED_COMMIT=${PINNED_COMMIT}" \
-    -t "${IMAGE_TAG}" \
-    -f "${SCRIPT_DIR}/Dockerfile" \
-    "${REPO_ROOT}"
-ok "Image built: ${IMAGE_TAG}"
+# Two paths:
+#   a) AUDIT_IMAGE env set  → pull that registry image and use it.
+#   b) AUDIT_IMAGE unset    → use the local autofyn-audit:pinned image; fail
+#      with an actionable message if it is not present.
+# ---------------------------------------------------------------------------
+RUN_IMAGE=""
+if [[ -n "${AUDIT_IMAGE:-}" ]]; then
+    info "AUDIT_IMAGE set — pulling registry image: ${AUDIT_IMAGE}"
+    docker pull "${AUDIT_IMAGE}" || \
+        die "Failed to pull AUDIT_IMAGE='${AUDIT_IMAGE}'. Check the reference and your credentials."
+    RUN_IMAGE="${AUDIT_IMAGE}"
+    ok "Pulled registry image: ${RUN_IMAGE}"
+else
+    if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
+        die "Pinned image ${IMAGE_TAG} not found locally.
+     Build it once with:
+       bash autofyn_audit/build_image.sh
+     (or set AUDIT_IMAGE=<registry-ref> to pull a pre-published image)."
+    fi
+    # Verify the OCI revision label if it exists (back-compat: warn if absent).
+    EXISTING_REVISION="$(docker image inspect \
+        --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+        "${IMAGE_TAG}" 2>/dev/null || true)"
+    if [[ -n "${EXISTING_REVISION}" ]]; then
+        if [[ "${EXISTING_REVISION}" != "${PINNED_COMMIT}" ]]; then
+            die "Image ${IMAGE_TAG} revision label '${EXISTING_REVISION}' does not match
+     pinned commit '${PINNED_COMMIT}'. Rebuild with:
+       bash autofyn_audit/build_image.sh --force"
+        fi
+        ok "Image revision label verified: ${EXISTING_REVISION}"
+    else
+        warn "Image ${IMAGE_TAG} has no org.opencontainers.image.revision label (older build). Proceeding."
+    fi
+    RUN_IMAGE="${IMAGE_TAG}"
+    ok "Using local pinned image: ${RUN_IMAGE}"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 3 — Start the mock server on the host
@@ -181,7 +209,7 @@ docker run -d \
     -e CI=1 \
     -e NODE_ENV=development \
     ${WEB_ENV_FLAGS} \
-    "${IMAGE_TAG}" \
+    "${RUN_IMAGE}" \
     bash -c "cd /app/apps/web && bun run dev:app"
 
 ok "${WEB_CONTAINER} started."
@@ -201,7 +229,7 @@ docker run -d \
     -e WRANGLER_SEND_METRICS=false \
     -e WRANGLER_LOG=error \
     -e CI=1 \
-    "${IMAGE_TAG}" \
+    "${RUN_IMAGE}" \
     bash -c "cd /app/apps/mcp && bun run dev:app"
 
 ok "${MCP_CONTAINER} started."
@@ -219,7 +247,7 @@ until curl -sf -o /dev/null "http://localhost:${WEB_HOST_PORT}/login"; do
         docker logs --tail=50 "${WEB_CONTAINER}" >&2
         die "${WEB_CONTAINER} did NOT become ready within ${WEB_READY_TIMEOUT}s.
      See logs above. Common causes: bun install incomplete, port conflict.
-     Re-run with --no-cache if dependencies changed."
+     If the image seems stale, rebuild with: bash autofyn_audit/build_image.sh --force"
     fi
     printf '.'
     sleep 2
@@ -259,6 +287,8 @@ echo -e "${_BOLD}${_GREEN}  SETUP COMPLETE — READY${_RESET}"
 echo -e "${_BOLD}${_GREEN}================================================================${_RESET}"
 echo "  Pinned commit : ${PINNED_COMMIT}"
 echo "  Pinned image  : ${PINNED_IMAGE}"
+echo "  Run image     : ${RUN_IMAGE}"
+echo "  Image id      : $(docker image inspect --format '{{.Id}}' "${RUN_IMAGE}" 2>/dev/null || echo 'unknown')"
 echo "  Web           : http://localhost:${WEB_HOST_PORT}   (${WEB_CONTAINER})"
 echo "  MCP           : http://localhost:${MCP_HOST_PORT}   (${MCP_CONTAINER})"
 echo "  Mock server   : http://localhost:${MOCK_PORT}  (host, PID ${MOCK_PID})"

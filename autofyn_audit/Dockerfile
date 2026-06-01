@@ -10,6 +10,7 @@
 FROM oven/bun:1.3.6@sha256:f20d9cf365ab35529384f1717687c739c92e6f39157a35a95ef06f4049a10e4a
 
 ARG EXPECTED_COMMIT=268499068810586495ba5bd4773f8c5786d9fc97
+LABEL org.opencontainers.image.revision=$EXPECTED_COMMIT
 
 # Install a REAL Node.js (>= 20) + curl.
 #
