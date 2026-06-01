@@ -1,0 +1,10 @@
+# Used by autofyn_audit/setup.sh docker build (build context = repo root)
+node_modules
+.git
+.next
+dist
+.open-next
+.turbo
+*.log
+.env*
+!.env.example
