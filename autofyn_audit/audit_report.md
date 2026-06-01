@@ -417,6 +417,19 @@ Proof file: `autofyn_audit/.audit_state/exploit_04.proof`
 - Requires a client that auto-follows `resource_metadata` links without user confirmation.
 - CRLF/header-splitting is NOT exploitable here.
 
+#### Chain Analysis — Does C4 Escalate to OAuth Token Theft? (investigated round 13)
+
+We tested whether the reflected metadata can be chained into actual authorization-code / access-token interception against a victim MCP client (the highest-impact outcome of OAuth metadata poisoning). **It does not — severity stays MEDIUM.** Reason, from the real source (`apps/mcp/src/index.ts`, audited commit `2684990`):
+
+- Only the **resource identifier** and the **discovery URL** reflect the attacker host:
+  - `resource: "${mcpBaseUrl(c)}/mcp"` (line 72) — cosmetic per RFC 9728; does not direct the flow.
+  - `WWW-Authenticate: Bearer ... resource_metadata="${mcpBaseUrl(c)}/.well-known/oauth-protected-resource/mcp"` (lines 125, 131, 171).
+- The fields that actually **direct where a client sends its code/token are hardcoded** and immune to Host-header injection:
+  - `authorization_servers: [apiUrl]` (line 73), where `apiUrl = c.env.API_URL || DEFAULT_API_URL` ("https://api.supermemory.ai") — a Workers env binding, not HTTP input.
+  - The `/.well-known/oauth-authorization-server` endpoint (lines 85–107) **fetches the real authorization-server metadata from `${apiUrl}` and returns it verbatim** — so `authorization_endpoint` / `token_endpoint` / `registration_endpoint` always point at the genuine Supermemory auth server, regardless of the Host header.
+
+So a spec-compliant client that follows the poisoned `resource_metadata` URL would read an attacker-served document, **but the `authorization_servers` it must then trust is fixed to the real auth server.** Substituting the auth/token endpoint would require the attacker to also serve a malicious protected-resource document AND have the client honor an attacker-chosen `authorization_servers` — which the genuine, in-band response does not provide. The token-theft step additionally cannot be demonstrated in this harness (no real MCP client performing the OAuth dance, no real upstream auth server); the maximum live-demonstrable effect is metadata reflection, which C4 Proof A/B already show. Claiming HIGH/CRITICAL here would require a MITM/header-injection precondition that a correctly deployed Cloudflare-fronted `mcp.supermemory.ai` does not expose. **Verdict: MEDIUM is correct; do not overstate.**
+
 #### Recommendation
 
 1. Set `MCP_URL` in all deployment environments (including local dev via `.env` / wrangler vars).
