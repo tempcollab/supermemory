@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# teardown.sh — Stop and remove audit containers, kill mock server, clean temp.
+# teardown.sh — Stop and remove audit containers + network. Idempotent.
 #
 # Usage:
-#   bash autofyn_audit/teardown.sh            # stop containers + mock
+#   bash autofyn_audit/teardown.sh            # stop containers + remove network
 #   bash autofyn_audit/teardown.sh --purge    # also remove image + .audit_state/
 #
 set -euo pipefail
@@ -10,8 +10,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUDIT_STATE_DIR="${SCRIPT_DIR}/.audit_state"
 IMAGE_TAG="autofyn-audit:pinned"
+AUDIT_NET="autofyn-audit-net"
 WEB_CONTAINER="autofyn-web"
 MCP_CONTAINER="autofyn-mcp"
+MOCK_CONTAINER="audit-mock"
 
 _GREEN='\033[0;32m'
 _CYAN='\033[0;36m'
@@ -28,32 +30,23 @@ done
 # ---------------------------------------------------------------------------
 # Remove containers (idempotent — ignore errors if not found)
 # ---------------------------------------------------------------------------
-info "Removing containers: ${WEB_CONTAINER}, ${MCP_CONTAINER}…"
-docker rm -f "${WEB_CONTAINER}" "${MCP_CONTAINER}" 2>/dev/null || true
+info "Removing containers: ${WEB_CONTAINER}, ${MCP_CONTAINER}, ${MOCK_CONTAINER}…"
+docker rm -f "${WEB_CONTAINER}" "${MCP_CONTAINER}" "${MOCK_CONTAINER}" 2>/dev/null || true
 ok "Containers removed (or did not exist)."
 
+# Clean up the stale mock.pid file if present (it held the in-container PID,
+# which is meaningless on the driver; the container removal above already stopped
+# the mock process).
+rm -f "${AUDIT_STATE_DIR}/mock.pid" 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
-# Kill mock server via PID file
+# Remove the shared docker network (idempotent)
+# docker rm -f above detaches the containers first; if other containers somehow
+# remain attached, network rm no-ops with || true.
 # ---------------------------------------------------------------------------
-if [[ -f "${AUDIT_STATE_DIR}/mock.pid" ]]; then
-    MOCK_PID="$(cat "${AUDIT_STATE_DIR}/mock.pid")"
-    if kill -0 "${MOCK_PID}" 2>/dev/null; then
-        info "Killing mock server (PID ${MOCK_PID})…"
-        kill "${MOCK_PID}" 2>/dev/null || true
-        sleep 1
-    else
-        info "Mock server (PID ${MOCK_PID}) was not running."
-    fi
-    rm -f "${AUDIT_STATE_DIR}/mock.pid"
-else
-    # Fallback: kill any process listening on port 9099
-    PIDS="$(lsof -ti tcp:9099 2>/dev/null || true)"
-    if [[ -n "${PIDS}" ]]; then
-        info "Killing processes on port 9099: ${PIDS}"
-        echo "${PIDS}" | xargs kill 2>/dev/null || true
-    fi
-fi
-ok "Mock server stopped."
+info "Removing network '${AUDIT_NET}'…"
+docker network rm "${AUDIT_NET}" 2>/dev/null || true
+ok "Network '${AUDIT_NET}' removed (or did not exist)."
 
 # ---------------------------------------------------------------------------
 # Optional --purge: remove image and state directory

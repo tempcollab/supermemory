@@ -5,18 +5,19 @@
 # ---------------------------------------------------------------------------
 # Service base URLs (override via env for non-default setups)
 # ---------------------------------------------------------------------------
-WEB_BASE="${WEB_BASE:-http://localhost:3000}"
-MCP_BASE="${MCP_BASE:-http://localhost:8788}"
+WEB_BASE="${WEB_BASE:-http://autofyn-web:3000}"
+MCP_BASE="${MCP_BASE:-http://autofyn-mcp:8788}"
 
-# The URL containers use to reach the mock server running on the Docker host.
-# On Linux, --add-host=host.docker.internal:host-gateway maps this name.
-# isPrivateHost() in og/route.ts only blocks literal RFC-1918 IPs and
-# localhost — DNS names such as host.docker.internal pass the check, which
-# is exactly the bypass class being demonstrated for C1.
-MOCK_HOST_FROM_CONTAINER="http://host.docker.internal:9099"
-
-# The URL scripts on the host use to reach the mock server.
-MOCK_HOST_FROM_SCRIPT="http://localhost:9099"
+# The URL used to reach the mock server by container name on the shared network.
+# isPrivateHost() in apps/web/app/api/og/route.ts:16-36 lowercases the hostname
+# and matches only the literal strings localhost, 127.0.0.1, ::1, prefixes 127.,
+# 0.0.0.0, and RFC-1918 regexes (^10\., ^172\.(1[6-9]|2[0-9]|3[01])\., ^192\.168\.).
+# The bare container name "audit-mock" (lowercased "audit-mock") matches NONE of
+# these, so isPrivateHost("audit-mock") === false and Node.js fetch() resolves the
+# name to its docker-network internal IP and makes the request — SSRF fires.
+# This is the DNS-name-not-IP bypass class (same as the original host.docker.internal
+# proof; only the resolvable target changes to one that exists on the shared network).
+MOCK_BASE="${MOCK_BASE:-http://audit-mock:9099}"
 
 # Pinned constants — must match setup.sh and the audit report.
 PINNED_COMMIT="268499068810586495ba5bd4773f8c5786d9fc97"
@@ -107,9 +108,11 @@ assert_not_contains() {
 # ---------------------------------------------------------------------------
 # mock_hits_since <unix_timestamp>
 # Returns JSON array of recorded hits from the mock server since timestamp.
+# IMPORTANT: keep || echo "[]" — the exploit scripts run under set -euo pipefail
+# and a curl failure (e.g. mock temporarily busy) must not abort the script.
 mock_hits_since() {
     local since="${1:-0}"
-    curl -sf "${MOCK_HOST_FROM_SCRIPT}/__hits?since=${since}" 2>/dev/null || echo "[]"
+    curl -sf "${MOCK_BASE}/__hits?since=${since}" 2>/dev/null || echo "[]"
 }
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# setup.sh — Resolve the pre-built audit image, start the web+mcp containers,
-# and start the mock server on the host.
+# setup.sh — Resolve the pre-built audit image, create the shared network,
+# start mock + web + mcp containers, and health-check all three.
 #
 # This script does NOT build the Docker image. Build it once (and only once)
 # before the first run with:
@@ -10,16 +10,17 @@
 # without rebuilding. To use a registry image instead, set AUDIT_IMAGE:
 #   AUDIT_IMAGE=ghcr.io/your-org/autofyn-audit:pinned bash autofyn_audit/setup.sh
 #
-# Prerequisites: docker, git, python3, curl
+# Prerequisites: docker, git, curl
 #
 # Usage: bash autofyn_audit/setup.sh
 #
-# Host-port overrides (use when ports 3000/8788 are already taken on the host):
-#        WEB_HOST_PORT=3001 MCP_HOST_PORT=8789 bash autofyn_audit/setup.sh
-#   The container-internal app ports stay 3000/8788; only the host-side
-#   published ports change. Run the exploits with matching bases:
-#        WEB_BASE=http://localhost:3001 MCP_BASE=http://localhost:8789 \
-#            bash autofyn_audit/run_exploits.sh
+# Reachability: all containers communicate over ${AUDIT_NET} by container name.
+# No published host port is required for exploit reproducibility. Published ports
+# (-p flags) are kept as optional convenience for humans on a real Docker host
+# but are NOT load-bearing. Exploit scripts reach services as:
+#   http://autofyn-web:3000   (autofyn-web)
+#   http://autofyn-mcp:8788   (autofyn-mcp)
+#   http://audit-mock:9099    (audit-mock)
 #
 set -euo pipefail
 
@@ -30,13 +31,20 @@ PINNED_COMMIT="268499068810586495ba5bd4773f8c5786d9fc97"
 PINNED_IMAGE="oven/bun:1.3.6@sha256:f20d9cf365ab35529384f1717687c739c92e6f39157a35a95ef06f4049a10e4a"
 IMAGE_TAG="autofyn-audit:pinned"
 
+# Mock image: python:3.12-slim pinned by digest (resolved from python:3.12-slim).
+# To re-resolve: docker buildx imagetools inspect python:3.12-slim
+MOCK_IMAGE="python@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203"
+
+AUDIT_NET="autofyn-audit-net"
 WEB_CONTAINER="autofyn-web"
 MCP_CONTAINER="autofyn-mcp"
+MOCK_CONTAINER="audit-mock"
+
 # Container-internal app ports (fixed — the apps listen on these inside the container).
 WEB_PORT=3000
 MCP_PORT=8788
 MOCK_PORT=9099
-# Host-side published ports (overridable to avoid conflicts with other workloads).
+# Host-side published ports (overridable to avoid conflicts; NOT load-bearing).
 WEB_HOST_PORT="${WEB_HOST_PORT:-3000}"
 MCP_HOST_PORT="${MCP_HOST_PORT:-8788}"
 
@@ -46,6 +54,7 @@ AUDIT_STATE_DIR="${SCRIPT_DIR}/.audit_state"
 
 WEB_READY_TIMEOUT=180   # seconds — next dev first build is slow
 MCP_READY_TIMEOUT=120   # seconds
+MOCK_READY_TIMEOUT=15   # seconds
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -92,29 +101,8 @@ ok "App source pin verified: identical to ${PINNED_COMMIT} (HEAD=${ACTUAL_COMMIT
 # Step 1 — Idempotent teardown of existing containers
 # ---------------------------------------------------------------------------
 info "Removing any existing audit containers…"
-docker rm -f "${WEB_CONTAINER}" "${MCP_CONTAINER}" 2>/dev/null || true
+docker rm -f "${WEB_CONTAINER}" "${MCP_CONTAINER}" "${MOCK_CONTAINER}" 2>/dev/null || true
 ok "Existing containers removed (or did not exist)."
-
-# ---------------------------------------------------------------------------
-# Step 1b — Pre-flight host-port availability check (clear error, not a cryptic
-#           docker bind failure mid-run).
-# ---------------------------------------------------------------------------
-port_in_use() {
-    # Returns 0 if something is already listening on the given host TCP port.
-    curl -s -o /dev/null --max-time 2 "http://localhost:${1}/" 2>/dev/null && return 0
-    # Also catch ports that accept connections but return nothing parseable.
-    (exec 3<>"/dev/tcp/localhost/${1}") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
-    return 1
-}
-for p in "${WEB_HOST_PORT}" "${MCP_HOST_PORT}"; do
-    if port_in_use "${p}"; then
-        die "Host port ${p} is already in use by another process/container.
-     Pick free host ports and re-run, e.g.:
-       WEB_HOST_PORT=3001 MCP_HOST_PORT=8789 bash autofyn_audit/setup.sh
-     then run the exploits against them:
-       WEB_BASE=http://localhost:3001 MCP_BASE=http://localhost:8789 bash autofyn_audit/run_exploits.sh"
-    fi
-done
 
 # ---------------------------------------------------------------------------
 # Step 2 — Resolve the pre-built audit image (NO inline build)
@@ -157,39 +145,77 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — Start the mock server on the host
+# Step 2b — Create the shared docker network (idempotent)
+# ---------------------------------------------------------------------------
+info "Ensuring docker network '${AUDIT_NET}' exists…"
+docker network inspect "${AUDIT_NET}" >/dev/null 2>&1 || docker network create "${AUDIT_NET}"
+ok "Network '${AUDIT_NET}' ready."
+
+# ---------------------------------------------------------------------------
+# Step 3 — Start the mock server as a container on the shared network
+#
+# File sharing strategy: docker cp (portable across bind-mount and named-volume
+# backed driver containers; avoids "Mounts denied" in gVisor/named-volume setups).
+#   - mock_server.py is copied IN to the container after create.
+#   - canary.txt is copied OUT to the driver fs after the health-check passes.
 # ---------------------------------------------------------------------------
 mkdir -p "${AUDIT_STATE_DIR}"
+rm -f "${AUDIT_STATE_DIR}/mock_hits.log"   # fresh hit log per run
 
-# Kill any existing mock server
-if [[ -f "${AUDIT_STATE_DIR}/mock.pid" ]]; then
-    OLD_PID="$(cat "${AUDIT_STATE_DIR}/mock.pid")"
-    if kill -0 "${OLD_PID}" 2>/dev/null; then
-        info "Killing existing mock server (PID ${OLD_PID})…"
-        kill "${OLD_PID}" 2>/dev/null || true
-        sleep 1
+info "Creating mock container '${MOCK_CONTAINER}' on network '${AUDIT_NET}'…"
+info "  Mock image: ${MOCK_IMAGE}"
+info "  File sharing: docker cp (no bind-mount — portable across host and named-volume topologies)"
+
+# Create (not run yet) so we can docker cp the script in before starting.
+# The entrypoint copies /tmp/mock_server.py → /mock/mock_server.py and runs it,
+# so docker cp only needs to reach /tmp (which always exists in the image).
+docker create \
+    --name "${MOCK_CONTAINER}" \
+    --network "${AUDIT_NET}" \
+    "${MOCK_IMAGE}" \
+    sh -c "mkdir -p /mock && cp /tmp/mock_server.py /mock/mock_server.py && python3 /mock/mock_server.py"
+
+# Copy mock_server.py into /tmp inside the (stopped) container.
+# docker cp works on stopped/created containers — no bind mount needed.
+docker cp "${SCRIPT_DIR}/mock_server.py" "${MOCK_CONTAINER}:/tmp/mock_server.py"
+
+docker start "${MOCK_CONTAINER}"
+ok "${MOCK_CONTAINER} started."
+
+# Health-check the mock from a runner container on the network (not localhost).
+# Uses `if ...; then` so a down mock yields the retry loop, not a pipefail abort.
+info "Waiting for mock server to be ready (up to ${MOCK_READY_TIMEOUT}s)…"
+MOCK_ELAPSED=0
+until docker run --rm --network "${AUDIT_NET}" "${RUN_IMAGE}" \
+        curl -sf --max-time 5 "http://${MOCK_CONTAINER}:${MOCK_PORT}/__hits" >/dev/null 2>&1; do
+    MOCK_ELAPSED=$((MOCK_ELAPSED + 1))
+    if [[ ${MOCK_ELAPSED} -gt ${MOCK_READY_TIMEOUT} ]]; then
+        echo ""
+        docker logs --tail=50 "${MOCK_CONTAINER}" >&2
+        die "Mock container did NOT start within ${MOCK_READY_TIMEOUT}s — see logs above."
     fi
-    rm -f "${AUDIT_STATE_DIR}/mock.pid"
-fi
-
-# Fresh hit log per setup so SSRF proofs are unambiguous.
-rm -f "${AUDIT_STATE_DIR}/mock_hits.log"
-
-info "Starting mock server on host port ${MOCK_PORT}…"
-python3 "${SCRIPT_DIR}/mock_server.py" &>"${AUDIT_STATE_DIR}/mock_server.log" &
-MOCK_PID=$!
-
-# Wait for mock to be ready (writes PID file when up)
-MOCK_WAIT=0
-until curl -sf "http://localhost:${MOCK_PORT}/__hits" >/dev/null 2>&1; do
-    MOCK_WAIT=$((MOCK_WAIT + 1))
-    [[ ${MOCK_WAIT} -gt 15 ]] && die "Mock server did not start within 15s — check ${AUDIT_STATE_DIR}/mock_server.log"
+    printf '.'
     sleep 1
 done
-ok "Mock server ready on port ${MOCK_PORT} (PID ${MOCK_PID})"
+echo ""
+ok "Mock server ready (http://${MOCK_CONTAINER}:${MOCK_PORT})."
+
+# Pull canary.txt from the mock container to the driver filesystem via docker cp.
+# mock_server.py writes canary.txt in setup_state_dir() before serve_forever(),
+# so once /__hits answers, canary.txt is already present inside the container.
+docker cp "${MOCK_CONTAINER}:/mock/.audit_state/canary.txt" "${AUDIT_STATE_DIR}/canary.txt" 2>/dev/null || true
+
+if [[ ! -f "${AUDIT_STATE_DIR}/canary.txt" ]]; then
+    die "canary.txt NOT found at ${AUDIT_STATE_DIR}/canary.txt after mock health-check passed.
+     docker cp from ${MOCK_CONTAINER}:/mock/.audit_state/canary.txt failed.
+     Check mock_server.py writes canary.txt to /mock/.audit_state/ on startup.
+     Container logs: docker logs ${MOCK_CONTAINER}"
+fi
+ok "Canary copied from mock container: ${AUDIT_STATE_DIR}/canary.txt"
+info "  Canary token: $(cat "${AUDIT_STATE_DIR}/canary.txt")"
 
 # ---------------------------------------------------------------------------
-# Step 4 — Start web container (next dev on port 3000)
+# Step 4 — Start web container (next dev on port 3000) on the shared network
 # ---------------------------------------------------------------------------
 info "Starting ${WEB_CONTAINER} (next dev, host port ${WEB_HOST_PORT} -> container ${WEB_PORT})…"
 info "  Note: WRANGLER_SEND_METRICS=false CI=1 are set; no XAI/EXA keys injected by default."
@@ -202,6 +228,7 @@ WEB_ENV_FLAGS=""
 # shellcheck disable=SC2086
 docker run -d \
     --name "${WEB_CONTAINER}" \
+    --network "${AUDIT_NET}" \
     --add-host=host.docker.internal:host-gateway \
     -p "${WEB_HOST_PORT}:${WEB_PORT}" \
     -e PORT="${WEB_PORT}" \
@@ -210,12 +237,12 @@ docker run -d \
     -e NODE_ENV=development \
     ${WEB_ENV_FLAGS} \
     "${RUN_IMAGE}" \
-    bash -c "cd /app/apps/web && bun run dev:app"
+    bash -c "cd /app/apps/web && bunx next dev -H 0.0.0.0 --port ${WEB_PORT}"
 
 ok "${WEB_CONTAINER} started."
 
 # ---------------------------------------------------------------------------
-# Step 5 — Start MCP container (wrangler dev on port 8788)
+# Step 5 — Start MCP container (wrangler dev on port 8788) on the shared network
 # ---------------------------------------------------------------------------
 info "Starting ${MCP_CONTAINER} (wrangler dev --local, host port ${MCP_HOST_PORT} -> container ${MCP_PORT})…"
 info "  MCP_URL is intentionally UNSET so C4 (host-header injection) is live-reproducible."
@@ -223,6 +250,7 @@ info "  MCP_URL is intentionally UNSET so C4 (host-header injection) is live-rep
 # shellcheck disable=SC2086
 docker run -d \
     --name "${MCP_CONTAINER}" \
+    --network "${AUDIT_NET}" \
     --add-host=host.docker.internal:host-gateway \
     -p "${MCP_HOST_PORT}:${MCP_PORT}" \
     -e PORT="${MCP_PORT}" \
@@ -230,17 +258,19 @@ docker run -d \
     -e WRANGLER_LOG=error \
     -e CI=1 \
     "${RUN_IMAGE}" \
-    bash -c "cd /app/apps/mcp && bun run dev:app"
+    bash -c "cd /app/apps/mcp && bun run build:ui && bunx wrangler dev --ip 0.0.0.0 --port ${MCP_PORT}"
 
 ok "${MCP_CONTAINER} started."
 
 # ---------------------------------------------------------------------------
-# Step 6 — Health-check web (up to WEB_READY_TIMEOUT seconds)
+# Step 6 — Health-check web from a runner container on the network
+# (not localhost — localhost is unreachable from the gVisor sandbox sibling)
+# --max-time 20 accommodates Next.js on-demand route compilation (10–15s first req)
 # ---------------------------------------------------------------------------
-info "Waiting for web app on host port ${WEB_HOST_PORT} (timeout ${WEB_READY_TIMEOUT}s)…"
+info "Waiting for web app on network (timeout ${WEB_READY_TIMEOUT}s)…"
 WEB_ELAPSED=0
-WEB_READY=false
-until curl -sf -o /dev/null "http://localhost:${WEB_HOST_PORT}/login"; do
+until docker run --rm --network "${AUDIT_NET}" "${RUN_IMAGE}" \
+        curl -sf -o /dev/null --max-time 20 "http://${WEB_CONTAINER}:${WEB_PORT}/login"; do
     WEB_ELAPSED=$((WEB_ELAPSED + 2))
     if [[ ${WEB_ELAPSED} -ge ${WEB_READY_TIMEOUT} ]]; then
         echo ""
@@ -253,16 +283,15 @@ until curl -sf -o /dev/null "http://localhost:${WEB_HOST_PORT}/login"; do
     sleep 2
 done
 echo ""
-WEB_READY=true
-ok "${WEB_CONTAINER} READY on http://localhost:${WEB_HOST_PORT}"
+ok "${WEB_CONTAINER} READY (http://${WEB_CONTAINER}:${WEB_PORT} on ${AUDIT_NET})"
 
 # ---------------------------------------------------------------------------
-# Step 7 — Health-check MCP (up to MCP_READY_TIMEOUT seconds)
+# Step 7 — Health-check MCP from a runner container on the network
 # ---------------------------------------------------------------------------
-info "Waiting for MCP server on host port ${MCP_HOST_PORT} (timeout ${MCP_READY_TIMEOUT}s)…"
+info "Waiting for MCP server on network (timeout ${MCP_READY_TIMEOUT}s)…"
 MCP_ELAPSED=0
-MCP_READY=false
-until curl -sf -o /dev/null "http://localhost:${MCP_HOST_PORT}/"; do
+until docker run --rm --network "${AUDIT_NET}" "${RUN_IMAGE}" \
+        curl -sf -o /dev/null --max-time 20 "http://${MCP_CONTAINER}:${MCP_PORT}/"; do
     MCP_ELAPSED=$((MCP_ELAPSED + 2))
     if [[ ${MCP_ELAPSED} -ge ${MCP_READY_TIMEOUT} ]]; then
         echo ""
@@ -275,8 +304,7 @@ until curl -sf -o /dev/null "http://localhost:${MCP_HOST_PORT}/"; do
     sleep 2
 done
 echo ""
-MCP_READY=true
-ok "${MCP_CONTAINER} READY on http://localhost:${MCP_HOST_PORT}"
+ok "${MCP_CONTAINER} READY (http://${MCP_CONTAINER}:${MCP_PORT} on ${AUDIT_NET})"
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -287,18 +315,15 @@ echo -e "${_BOLD}${_GREEN}  SETUP COMPLETE — READY${_RESET}"
 echo -e "${_BOLD}${_GREEN}================================================================${_RESET}"
 echo "  Pinned commit : ${PINNED_COMMIT}"
 echo "  Pinned image  : ${PINNED_IMAGE}"
+echo "  Mock image    : ${MOCK_IMAGE}"
 echo "  Run image     : ${RUN_IMAGE}"
 echo "  Image id      : $(docker image inspect --format '{{.Id}}' "${RUN_IMAGE}" 2>/dev/null || echo 'unknown')"
-echo "  Web           : http://localhost:${WEB_HOST_PORT}   (${WEB_CONTAINER})"
-echo "  MCP           : http://localhost:${MCP_HOST_PORT}   (${MCP_CONTAINER})"
-echo "  Mock server   : http://localhost:${MOCK_PORT}  (host, PID ${MOCK_PID})"
+echo "  Network       : ${AUDIT_NET}"
+echo "  Web           : http://autofyn-web:3000   (${WEB_CONTAINER})"
+echo "  MCP           : http://autofyn-mcp:8788   (${MCP_CONTAINER})"
+echo "  Mock server   : http://audit-mock:9099     (${MOCK_CONTAINER})"
 echo "  Canary token  : $(cat "${AUDIT_STATE_DIR}/canary.txt" 2>/dev/null || echo 'NOT YET WRITTEN')"
 echo ""
-if [[ "${WEB_HOST_PORT}" != "3000" || "${MCP_HOST_PORT}" != "8788" ]]; then
-echo "  NON-DEFAULT PORTS — run exploits with matching bases:"
-echo "    WEB_BASE=http://localhost:${WEB_HOST_PORT} MCP_BASE=http://localhost:${MCP_HOST_PORT} bash autofyn_audit/run_exploits.sh"
-else
 echo "  Run exploits  : bash autofyn_audit/run_exploits.sh"
-fi
 echo "  Teardown      : bash autofyn_audit/teardown.sh"
 echo -e "${_BOLD}${_GREEN}================================================================${_RESET}"
