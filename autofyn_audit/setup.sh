@@ -214,6 +214,32 @@ fi
 ok "Canary copied from mock container: ${AUDIT_STATE_DIR}/canary.txt"
 info "  Canary token: $(cat "${AUDIT_STATE_DIR}/canary.txt")"
 
+# Pull C10-specific files: internal_canary.txt and mock_ip.txt.
+# mock_server.py self-discovers its own network IP and writes these in setup_state_dir().
+# mock_ip.txt is the SINGLE SOURCE OF TRUTH for the blocked-range IP used in:
+#   - mock's 302 Location header (/redirect-to-internal)
+#   - exploit_10 Proof A direct target
+#   - exploit_10 Proof B redirect destination assertion
+# Do NOT make setup fail if absent — the exploit reads them defensively and
+# will FAIL LOUDLY (INCONCLUSIVE) rather than false-passing if the file is missing.
+docker cp "${MOCK_CONTAINER}:/mock/.audit_state/internal_canary.txt" \
+    "${AUDIT_STATE_DIR}/internal_canary.txt" 2>/dev/null || true
+docker cp "${MOCK_CONTAINER}:/mock/.audit_state/mock_ip.txt" \
+    "${AUDIT_STATE_DIR}/mock_ip.txt" 2>/dev/null || true
+
+if [[ -f "${AUDIT_STATE_DIR}/internal_canary.txt" ]]; then
+    ok "Internal canary (C10) copied: ${AUDIT_STATE_DIR}/internal_canary.txt"
+    info "  Internal canary: $(cat "${AUDIT_STATE_DIR}/internal_canary.txt")"
+else
+    warn "internal_canary.txt not found — C10 exploit will report INCONCLUSIVE."
+fi
+if [[ -f "${AUDIT_STATE_DIR}/mock_ip.txt" ]]; then
+    ok "Mock IP (C10) copied: ${AUDIT_STATE_DIR}/mock_ip.txt"
+    info "  Mock blocked-range IP: $(cat "${AUDIT_STATE_DIR}/mock_ip.txt")"
+else
+    warn "mock_ip.txt not found — C10 exploit will report INCONCLUSIVE."
+fi
+
 # ---------------------------------------------------------------------------
 # Step 4 — Start web container (next dev on port 3000) on the shared network
 # ---------------------------------------------------------------------------
@@ -323,6 +349,7 @@ echo "  Web           : http://autofyn-web:3000   (${WEB_CONTAINER})"
 echo "  MCP           : http://autofyn-mcp:8788   (${MCP_CONTAINER})"
 echo "  Mock server   : http://audit-mock:9099     (${MOCK_CONTAINER})"
 echo "  Canary token  : $(cat "${AUDIT_STATE_DIR}/canary.txt" 2>/dev/null || echo 'NOT YET WRITTEN')"
+echo "  Mock IP (C10) : $(cat "${AUDIT_STATE_DIR}/mock_ip.txt" 2>/dev/null || echo 'NOT YET WRITTEN') (blocked-range IP for C10 redirect bypass)"
 echo ""
 echo "  Run exploits  : bash autofyn_audit/run_exploits.sh"
 echo "  Teardown      : bash autofyn_audit/teardown.sh"
