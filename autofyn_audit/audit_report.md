@@ -12,7 +12,7 @@
 
 **Date:** 2026-06-01
 
-**Status:** 4 Medium Vulnerabilities Confirmed (live) + 4 End-to-End Unauthenticated Exploit Chains
+**Status:** 1 High + 3 Medium Vulnerabilities Confirmed (live) + 4 End-to-End Unauthenticated Exploit Chains
 
 ---
 
@@ -36,7 +36,7 @@ Strongest live-confirmed issues:
 - **Unauthenticated reach of `/api/onboarding/*`** via the same `?view=mcp` bypass (C8) — a prompt-injection surface and paid-API cost-abuse vector.
 - **MCP OAuth metadata host-header injection** (C4) — `x-forwarded-host` is reflected verbatim into OAuth discovery documents when `MCP_URL` is unset.
 
-**Chain evidence levels:** All four counted findings (C1, C4, C7, C8) and the two `/api/og` deepenings (C9, C10) were executed live against the pinned image over the `autofyn-audit-net` Docker network and passed. The full-impact case for the SSRF family (reading cloud IMDS credentials) applies to **Node / self-host deployments**; the flagship Cloudflare-hosted production sets `global_fetch_strictly_public` (`apps/web/wrangler.jsonc:12`), which blocks private/link-local egress at the platform layer — including redirect targets — and is the honest reason every SSRF finding is capped at MEDIUM rather than HIGH.
+**Chain evidence levels:** All four counted findings (C1, C4, C7, C8) and the two `/api/og` deepenings (C9, C10) were executed live against the pinned image over the `autofyn-audit-net` Docker network and passed. The unauthenticated SSRF (C7) carries a **7.5 / HIGH base score** — appending `?view=mcp` is trivial (AC:L), needs no credentials (PR:N), and reads & reflects internal content including cloud IMDS (C:H). The full-impact case applies to **Node / self-host deployments**; the flagship Cloudflare-hosted production sets `global_fetch_strictly_public` (`apps/web/wrangler.jsonc:12`), which blocks private/link-local egress at the platform layer — including redirect targets. We model that as an **Environmental** mitigation (lowering the hosted-prod real-world score to ~5.x) rather than baking it into the base Attack Complexity, so the base vectors stay honest.
 
 Four candidates from earlier rounds were **refuted by live testing** and are documented (not counted) in the appendix: C2/C3 (`/api/onboarding/*` are auth-gated on the normal request path), C5 (RSC/prefetch middleware bypass — gate held), and C6 (`supermemory-mcp` npm name is already published by a third party, so the dependency-confusion precondition fails). Inspection-only CI/CD findings are listed separately and are not in the live-confirmed counts.
 
@@ -54,11 +54,13 @@ Four candidates from earlier rounds were **refuted by live testing** and are doc
 
 | ID | Vulnerability | Severity | CVSS | Status | Evidence |
 |----|---------------|----------|------|--------|----------|
-| SMEM-001 (C7) | Unauthenticated SSRF in `/api/og` via `?view=mcp` middleware bypass | MEDIUM | 5.9 | Confirmed | Direct Supermemory Exploit + Attacker Infrastructure |
+| SMEM-001 (C7) | Unauthenticated SSRF in `/api/og` via `?view=mcp` middleware bypass | HIGH | 7.5 | Confirmed | Direct Supermemory Exploit + Attacker Infrastructure |
+| SMEM-003 (C1) | SSRF in `/api/og` (DNS-name + link-local blocklist gaps) | MEDIUM | 6.5 | Confirmed | Direct Supermemory Exploit + Attacker Infrastructure |
 | SMEM-002 (C8) | Unauthenticated reach of `/api/onboarding/*` via `?view=mcp` middleware bypass | MEDIUM | 5.3 | Confirmed | Direct Supermemory Exploit |
-| SMEM-003 (C1) | SSRF in `/api/og` (DNS-name + link-local blocklist gaps) | MEDIUM | 5.0 | Confirmed | Direct Supermemory Exploit + Attacker Infrastructure |
-| SMEM-004 (C4) | MCP host-header injection in OAuth metadata | MEDIUM | 4.8 | Confirmed | Direct Supermemory Exploit |
-| L1 | Presence-only cookie validation on `/api/*` | LOW/INFO | 3.1 | Confirmed | Direct Supermemory Exploit |
+| SMEM-004 (C4) | MCP host-header injection in OAuth metadata | MEDIUM | 4.2 | Confirmed | Direct Supermemory Exploit |
+| L1 | Presence-only cookie validation on `/api/*` | INFO | 0.0 | Confirmed | Direct Supermemory Exploit |
+
+*Base CVSS scores reflect the vulnerability in the code as shipped (the self-hosted / Node deployment path, which is a real distribution). On the flagship Cloudflare-hosted production, `global_fetch_strictly_public` blocks the SSRF egress — an Environmental mitigation (`MC:N`) that lowers the real-world score of SMEM-001/SMEM-003 to the ~5.x MEDIUM range. We report the honest base vector and treat the platform mitigation as a separate, explicit factor rather than baking it into Attack Complexity.*
 
 *C9 and C10 are not separate findings — they are live-confirmed deepenings of the C7/C1 `/api/og` SSRF family (non-blind reflection + metadata-range blocklist gap; and redirect-based blocklist bypass). They are documented in the Exploit Chains section and folded into SMEM-001/SMEM-003.*
 
@@ -72,16 +74,16 @@ All chains combine the `?view=mcp` middleware bypass (keystone: `apps/web/middle
 
 | Chain | Severity | Vulnerabilities | Exploit Script | Evidence | Result |
 |-------|----------|-----------------|----------------|----------|--------|
-| C7 | MEDIUM | `?view=mcp` bypass + `/api/og` SSRF | `exploits/exploit_07_viewmcp_og_ssrf_unauth.sh` | Direct + Attacker Infra | **PASS** |
+| C7 | HIGH | `?view=mcp` bypass + `/api/og` SSRF | `exploits/exploit_07_viewmcp_og_ssrf_unauth.sh` | Direct + Attacker Infra | **PASS** |
 | C8 | MEDIUM | `?view=mcp` bypass + `/api/onboarding/*` | `exploits/exploit_08_viewmcp_onboarding_reachable.sh` | Direct Exploit | **PASS** |
-| C9 | MEDIUM | `?view=mcp` bypass + `/api/og` non-blind reflection + `169.254/16` gap | `exploits/exploit_09_metadata_ssrf.sh` | Direct + Attacker Infra | **PASS** |
-| C10 | MEDIUM | `?view=mcp` bypass + `/api/og` redirect blocklist bypass | `exploits/exploit_10_og_redirect_ssrf_bypass.sh` | Direct + Attacker Infra | **PASS** |
+| C9 | HIGH | `?view=mcp` bypass + `/api/og` non-blind reflection + `169.254/16` gap | `exploits/exploit_09_metadata_ssrf.sh` | Direct + Attacker Infra | **PASS** |
+| C10 | HIGH | `?view=mcp` bypass + `/api/og` redirect blocklist bypass | `exploits/exploit_10_og_redirect_ssrf_bypass.sh` | Direct + Attacker Infra | **PASS** |
 
 ---
 
 ### C7 — Unauthenticated SSRF in `/api/og` via `?view=mcp` Middleware Bypass
 
-**Severity:** MEDIUM
+**Severity:** HIGH (7.5 base; ~5.x on Cloudflare-hosted prod via `global_fetch_strictly_public`)
 **Vulnerabilities:** `?view=mcp` middleware bypass (`apps/web/middleware.ts:30-32`) + `/api/og` SSRF sink (`apps/web/app/api/og/route.ts:182`)
 **Exploit script:** `exploits/exploit_07_viewmcp_og_ssrf_unauth.sh`
 **Evidence:** Direct Supermemory Exploit + Attacker Infrastructure
@@ -143,7 +145,7 @@ Proof file: `autofyn_audit/.audit_state/exploit_08.proof`
 
 ### C9 — Non-Blind SSRF Reflection + Cloud-Metadata-Range Blocklist Gap in `/api/og` (deepens C7/C1)
 
-**Severity:** MEDIUM
+**Severity:** HIGH (part of the C7 SSRF family; ~5.x on Cloudflare-hosted prod)
 **Vulnerabilities:** `?view=mcp` bypass + `/api/og` content reflection (`route.ts:199-236`) + missing `169.254.0.0/16` rule in `isPrivateHost()` (`route.ts:16-36`)
 **Exploit script:** `exploits/exploit_09_metadata_ssrf.sh`
 **Evidence:** Direct Supermemory Exploit + Attacker Infrastructure
@@ -173,7 +175,7 @@ Proof file: `autofyn_audit/.audit_state/exploit_09.proof`
 
 ### C10 — Redirect Defeats `isPrivateHost` Blocklist Entirely in `/api/og` (deepens C7/C9)
 
-**Severity:** MEDIUM
+**Severity:** HIGH (part of the C7 SSRF family; ~5.x on Cloudflare-hosted prod)
 **Vulnerabilities:** `?view=mcp` bypass + blocklist checked on initial URL only (`route.ts:159`) + `fetch()` with no `redirect` option → `redirect:"follow"` (`route.ts:182`) + content reflection (`route.ts:199-236`)
 **Exploit script:** `exploits/exploit_10_og_redirect_ssrf_bypass.sh`
 **Evidence:** Direct Supermemory Exploit + Attacker Infrastructure
@@ -208,7 +210,7 @@ Proof file: `autofyn_audit/.audit_state/exploit_10.proof`
 
 ### SMEM-001 (C7) — Unauthenticated SSRF in `/api/og` via `?view=mcp` Middleware Bypass
 
-**Severity:** MEDIUM — CVSS 5.9 `CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N`
+**Severity:** HIGH — CVSS 7.5 `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N`
 **CWE:** CWE-918: Server-Side Request Forgery (SSRF)
 **Affected code:** `apps/web/middleware.ts:30-32` (bypass), `apps/web/app/api/og/route.ts:16-36` (`isPrivateHost`), `:182` (fetch)
 
@@ -236,7 +238,7 @@ bash autofyn_audit/exploits/exploit_07_viewmcp_og_ssrf_unauth.sh
 
 **Remediation:** Do not return `NextResponse.next()` for `?view=mcp` before the `/api/*` gate — scope the public exception to the specific page path(s) that need it, and never to `/api/*`. Enforce authentication in the route handler as well.
 
-**Production mitigation:** `apps/web/wrangler.jsonc:12` sets `global_fetch_strictly_public`, which blocks private/link-local egress on Cloudflare Workers. Full impact applies to Node/self-host deployments; this is the reason severity is MEDIUM, not HIGH (modeled as AC:H — the flagship deployment blocks the egress).
+**Production mitigation (Environmental, not base):** `apps/web/wrangler.jsonc:12` sets `global_fetch_strictly_public`, which blocks private/link-local egress on Cloudflare Workers. The 7.5 base score reflects the code as shipped (unauthenticated, trivial to trigger, reads and reflects internal content — AC:L, C:H). On the Cloudflare-hosted production the egress is blocked at the platform layer, which is an Environmental modifier (`MC:N`) lowering the real-world score to the ~5.x MEDIUM range. The full HIGH impact applies to Node / self-hosted deployments. We do **not** fold this into base Attack Complexity — AC:H would falsely imply the attack itself is hard, which it is not.
 
 ---
 
@@ -277,7 +279,7 @@ bash autofyn_audit/exploits/exploit_08_viewmcp_onboarding_reachable.sh
 
 ### SMEM-003 (C1) — SSRF in `/api/og` (DNS-Name + Link-Local Blocklist Gaps)
 
-**Severity:** MEDIUM — CVSS 5.0 `CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N`
+**Severity:** MEDIUM — CVSS 6.5 `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N`
 **CWE:** CWE-918: Server-Side Request Forgery (SSRF)
 **Affected code:** `apps/web/app/api/og/route.ts:16-36` (`isPrivateHost`), `:159` (block-400), `:182` (fetch), `:199-236` (reflection)
 
@@ -311,13 +313,13 @@ bash autofyn_audit/exploits/exploit_01_og_ssrf.sh
 
 **Remediation:** Add `169.254.0.0/16`, `100.64.0.0/10`, and `fd00::/8` to `isPrivateHost()`; resolve the hostname via DNS before the allowlist check; set `redirect: "manual"` and re-validate each redirect hop; or proxy external-only URLs through an allowlist.
 
-**Production mitigation:** `global_fetch_strictly_public` (`apps/web/wrangler.jsonc:12`) blocks the egress on Cloudflare Workers; full impact applies to Node/self-host.
+**Production mitigation (Environmental, not base):** `global_fetch_strictly_public` (`apps/web/wrangler.jsonc:12`) blocks the egress on Cloudflare Workers (`MC:N` → ~4.x real-world); full base impact applies to Node/self-host. The PR:L reflects the dummy-cookie precondition (L1); via the `?view=mcp` bypass the same sink is reachable with PR:N (that path is SMEM-001).
 
 ---
 
 ### SMEM-004 (C4) — MCP Host-Header Injection in OAuth Metadata
 
-**Severity:** MEDIUM — CVSS 4.8 `CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`
+**Severity:** MEDIUM — CVSS 4.2 `CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:L/I:L/A:N`
 **CWE:** CWE-20: Improper Input Validation (Host header) → OAuth metadata poisoning
 **Affected code:** `apps/mcp/src/index.ts:28-33` (`mcpBaseUrl`), `:69-78` (well-known JSON), `:125-131` (WWW-Authenticate)
 
@@ -351,11 +353,13 @@ bash autofyn_audit/exploits/exploit_04_mcp_host_header_injection.sh
 
 ### L1 — Presence-Only Cookie Validation on `/api/*` (LOW/INFO)
 
-**Severity:** LOW/INFO — CVSS 3.1 `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N`
+**Severity:** INFO — CVSS 0.0 `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N` (no standalone impact; scored as an enabler in prose)
 **CWE:** CWE-287: Improper Authentication
 **Affected code:** `apps/web/middleware.ts:5-10,34-44`
 
 **Description:** The middleware gates `/api/*` on the mere presence of a session cookie (`if (!sessionCookie)`); `getSessionCookie` only reads/decodes the cookie value with no signature verification or server-side lookup. Any non-empty value (e.g. `Cookie: better-auth-dev.session_token=x`) satisfies the gate. Real validation is downstream at `api.supermemory.ai` (out of scope). This is the enabler that lets SMEM-003 (C1) be reached with a fake cookie.
+
+**Scoring note:** L1 has no standalone CVSS impact (C:N/I:N/A:N = 0.0) — the edge gate is cosmetic and real auth is enforced upstream at `api.supermemory.ai`, which this finding does not weaken. Its significance is as an *enabler*: it lets SMEM-003 (C1) be reached with a forged cookie. That enabled impact is already scored under SMEM-003, so crediting it here too would double-count. Reported as Informational.
 
 **Remediation:** Validate the session token cryptographically at the edge if the gate is meant to be authoritative, or document that the middleware gate is cosmetic and real auth is enforced by the API backend.
 
