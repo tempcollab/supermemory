@@ -1,0 +1,11 @@
+node_modules
+.git
+.next
+dist
+.open-next
+.turbo
+*.log
+.env*
+!.env.example
+autofyn_audit
+**/__pycache__
